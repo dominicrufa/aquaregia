@@ -314,7 +314,7 @@ def make_canonical_energy_fn(system : openmm.System,
 
     def out_energy_fn(xs : Array, parameters : ArrayTree):
         running_sum = 0.
-        for key in KNOWN_FORCE_fns.keys():
+        for key in parameters.keys():
             running_sum = running_sum + out_fns[key](xs, parameters[key])
 
         return running_sum
@@ -327,3 +327,54 @@ def make_canonical_energy_fn(system : openmm.System,
         returnable_fn = out_energy_fn
 
     return out_params, returnable_fn
+
+# Utility
+def make_scale_system(system : openmm.System,
+                      target_ps : Sequence[int],
+                      remove_angles : Optional[bool] = True,
+                      nb_scale_factor : Optional[float] = 1e-3) -> openmm.System:
+    """
+    make a deecopy of a system and scale the torsion, nb, and nb_exception parameters of all terms containing `target_ps`.
+    optionally scale angles, as well
+    """
+    from copy import deepcopy
+    out_system = deepcopy(system)
+
+    torsion_f = out_system.getForces()[-2]
+    nbf = out_system.getForces()[-1]
+
+    target_ps_set = set(target_ps)
+
+    # assert there are no constraints.
+    assert out_system.getNumConstraints() == 0, f"we need not constraints"
+
+    if remove_angles:
+        angle_force = out_system.getForces()[-3]
+        #angles
+        for angle_idx in range(angle_force.getNumAngles()):
+            p1, p2, p3, angle, k = angle_force.getAngleParameters(angle_idx)
+            if target_ps_set.issubset({p1, p2, p3}):
+                angle_force.setAngleParameters(angle_idx, p1, p2, p3, angle, k * nb_scale_factor)
+
+
+    # torsions
+    for torsion_idx in range(torsion_f.getNumTorsions()):
+        torsion_parameters = torsion_f.getTorsionParameters(torsion_idx)
+        torsion_param_set = set(torsion_parameters[:4])
+        per, phase, k = torsion_parameters[4:]
+        if target_ps_set.issubset(torsion_param_set):
+            torsion_f.setTorsionParameters(torsion_idx, *torsion_parameters[:4], per, phase, k * 0.)
+
+    # nonbondeds
+    for p_idx in range(nbf.getNumParticles()):
+        charge, sigma, eps = nbf.getParticleParameters(p_idx)
+        if p_idx in target_ps:
+            nbf.setParticleParameters(p_idx, charge * nb_scale_factor, sigma, eps * nb_scale_factor)
+
+    #nonbonded exceptions
+    for nonbonded_exception_idx in range(nbf.getNumExceptions()):
+        p1, p2, chargeProd, sigma, eps = nbf.getExceptionParameters(nonbonded_exception_idx)
+        if {p1, p2}.issubset(target_ps_set):
+            nbf.setExceptionParameters(nonbonded_exception_idx, p1, p2, chargeProd * nb_scale_factor, sigma, eps * nb_scale_factor)
+
+    return out_system

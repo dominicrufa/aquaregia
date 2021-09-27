@@ -2,6 +2,9 @@
 from aquaregia.nets import *
 from aquaregia.utils import get_normal_test_graph
 
+# constants
+DEFAULT_MLP_SCALARS = {'update_xs': 1., 'velocity_t_fn': 1., 'velocity_log_s_fn': 1.}
+
 def test_message_fn(seed = random.PRNGKey(214),
                     message_features=3,
                     num_nodes=5,
@@ -104,6 +107,8 @@ def test_simple_equivariance(seed = random.PRNGKey(226),
                      shift_fn = shift_fn,
                      seed = init_seed,
                      C = 1.,
+                     use_vs_make_scalars = True,
+                     make_scalars_vals = DEFAULT_MLP_SCALARS,
                      num_VRV_repeats = 2, #try for 2
 
                      # optional activation fns
@@ -174,6 +179,8 @@ def test_logdetJ(seed = random.PRNGKey(747),
                      shift_fn = shift_fn,
                      seed = init_seed,
                      C = 1.,
+                     use_vs_make_scalars = True,
+                     make_scalars_vals = DEFAULT_MLP_SCALARS,
                      num_VRV_repeats = 2, #try for 2
 
                      # optional activation fns

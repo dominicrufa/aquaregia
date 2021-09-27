@@ -1,0 +1,210 @@
+"""library of kernels"""
+# Imports
+from typing import Sequence, Callable, Dict, Tuple, Optional, Union, Any, NamedTuple
+from jraph._src.utils import ArrayTree
+import jax
+import flax.linen as nn
+import jax.numpy as jnp
+from functools import partial
+from jax import grad, vmap, jit, random
+import numpy as onp
+import jax_md
+
+# configure float64 by default
+from jax.config import config
+config.update("jax_enable_x64", True)
+
+# Typing
+Conf = Params = Array = Seed = jnp.array
+from jraph._src.models import ArrayTree
+EnergyFn = Callable[[Array, ArrayTree, ...], float]
+import jax_md
+from simtk import openmm, unit
+
+def kinetic_energy(vs, mass):
+    def ke(_v, _mass):
+        return 0.5 * _v.dot(_v) / _mass
+    return vmap(ke, in_axes=(0,0))(vs, mass).sum()
+
+def metropolize_bool(reduced_work : float, # unitless
+                     seed: Array # random seed
+                     ) -> bool:
+    """from a (unitless) work value and a seed, return accept/reject"""
+    log_acceptance_prob = jnp.min(Array([0., -work]))
+    lu = jnp.log(random.uniform(seed))
+    accept = (lu <= log_acceptance_prob)
+    return accept
+
+def V_update(xs : Array,
+             vs : Array,
+             potential_energy_fn : EnergyFn,
+             potential_energy_params : ArrayTree,
+             dt : float,
+             mass : Array) -> Array:
+    return vs + -grad(potential_energy_fn)(xs, potential_energy_params) * dt / mass[..., jnp.newaxis]
+
+def R_update(xs : Array,
+             vs : Array,
+             dt : float,
+             shift_fn : jax_md.space.ShiftFn) -> Array:
+
+    return vmap(shift_fn, in_axes=(0,0))(xs, vs * dt)
+
+def O_update(vs : Array,
+             noise_seed : Seed,
+             mass : Array,
+             a : float,
+             b : float,
+             kT : float) -> Array:
+    n, d = vs.shape
+    return a * vs + b * jnp.sqrt(kT / mass[..., jnp.newaxis]) * random.normal(noise_seed, shape=(n,d))
+
+
+def make_static_BAOAB_kernel(potential_energy_fn : EnergyFn,
+                             dt : float,
+                             gamma : float,
+                             mass : Array,
+                             shift_fn : jax_md.space.ShiftFn,
+                             kinetic_energy_fn : Optional[EnergyFn] = kinetic_energy,
+                             get_shadow_work : Optional[bool] = False,
+                             ) -> Callable[Tuple[Array, Array, Array, ArrayTree, float], Tuple[Array, Array, float]]:
+    """
+    function that returns a static BAOAB kernel
+    TODO : support neighbor lists.
+    """
+    a, b = jnp.exp(-gamma * dt), jnp.sqrt(1. - jnp.exp(-2. * gamma * dt)) # get the a and b parameters
+
+    #partial kernel fns
+    partial_V_update = partial(V_update, potential_energy_fn=potential_energy_fn, dt = dt/2., mass = mass)
+    partial_R_update = partial(R_update, dt = dt/2., shift_fn=shift_fn)
+    partial_O_update = partial(O_update, mass = mass, a = a, b = b)
+    partial_ke = partial(kinetic_energy_fn, mass = mass)
+
+    if get_shadow_work:
+        ke_fn = partial_ke
+        pe_fn = potential_energy_fn
+    else:
+        ke_fn = lambda x: 0.
+        pe_fn = lambda x, y: 0.
+
+    def run(xs : Array,
+            vs : Array,
+            seed : Array,
+            potential_energy_params : ArrayTree,
+            kT : float) -> Tuple[Array, Array, float]:
+        """returns new xs, vs, and the (unit'd) shadow work if specified; otherwise is zero"""
+        e0 = ke_fn(vs) + pe_fn(xs, potential_energy_params)
+
+        vs1 = partial_V_update(xs, vs, potential_energy_params=potential_energy_params) #V
+        xs1 = partial_R_update(xs, vs1) #R
+        ke0 = ke_fn(vs1)
+        vs2 = partial_O_update(vs = vs1, noise_seed=seed, kT=kT) #O
+        ke1 = ke_fn(vs2)
+        xs2 = partial_R_update(xs1, vs2) #R
+        vs3 = partial_V_update(xs2, vs2, potential_energy_params = potential_energy_params) #V
+
+        e1 = ke_fn(xs2) + pe_fn(vs3, potential_energy_params)
+
+        return xs2, vs3, e1 - e0 - (ke1 - ke0)
+
+    return run
+
+def make_folded_integrator(integrator,
+                           mod_potential_params_fn,
+                           mod_kT_fn,
+                           potential_energy_fn,
+                          ):
+    """make a folded integrator"""
+
+    def scan_int(carry, x):
+        """carry is xs, vs, start_pe, seed"""
+        in_xs, in_vs, start_pe, in_seed = carry #open the carry
+        out_seed, run_seed = random.split(in_seed) # split the in_seed
+
+        kT = mod_kT_fn(x) #get kT
+        potential_energy_params = mod_potential_params_fn(x) # get potential energy params
+
+        end_pe = potential_energy_fn(in_xs, potential_energy_params)
+
+        out_xs, out_vs, out_shadow_work = integrator(xs = in_xs,
+                                              vs = in_vs,
+                                              seed = run_seed,
+                                              potential_energy_params = potential_energy_params,
+                                              kT = kT) # run the integrator
+
+        H_work = end_pe - start_pe #compute the protocol work (this is only necessary for nonequilibrium stuff)
+
+        return (out_xs, out_vs, end_pe, out_seed), H_work + out_shadow_work
+
+    def folded_integrator(xs, vs, start_pe, seed, sequence):
+        in_carry = (xs, vs, start_pe, seed)
+        out_carry, cumulative_works = jax.lax.scan(scan_int, in_carry, sequence)
+        out_xs, out_vs, out_pe, seed = out_carry
+        return out_xs, out_vs, cumulative_works
+
+    return folded_integrator
+
+def get_folded_equilibrium_integrator(potential_energy_fn : EnergyFn,
+                                      potential_energy_parameters : ArrayTree,
+                                      kT : float,
+                                      dt : float,
+                                      gamma : float,
+                                      mass : Array,
+                                      shift_fn : jax_md.space.ShiftFn,
+                                      kinetic_energy_fn : Optional[EnergyFn] = kinetic_energy,
+                                      get_shadow_work : Optional[bool] = False):
+    """make an equilibrium simulator"""
+    base_integrator = make_static_BAOAB_kernel(potential_energy_fn = potential_energy_fn,
+                             dt = dt,
+                             gamma = gamma,
+                             mass = mass,
+                             shift_fn = shift_fn,
+                             kinetic_energy_fn = kinetic_energy_fn,
+                             get_shadow_work = get_shadow_work,
+                             )
+
+    def mod_potential_params_fn(*args): return potential_energy_parameters
+    def mod_kT_fn(*args): return kT
+    def dummy_potential_energy_fn(*args): return 0.
+
+
+    folded_integrator = make_folded_integrator(integrator = base_integrator,
+                                               mod_potential_params_fn=mod_potential_params_fn,
+                                               mod_kT_fn=mod_kT_fn,
+                                               potential_energy_fn=dummy_potential_energy_fn)
+    return folded_integrator
+
+# utility to thermalize velocities
+def thermalize(seed, masses, kT, dimension):
+    """the mean is 0 and the standard deviation is sqrt(kT/m) for each particle."""
+    std_devs = jnp.sqrt(kT / masses)
+    out = random.normal(seed, shape=(len(masses), dimension)) * std_devs[..., jnp.newaxis]
+    return out
+
+def get_nonequilibrium_integrator(potential_energy_fn : EnergyFn,
+                                  potential_energy_parameters : ArrayTree,
+                                  kT : float,
+                                  dt : float,
+                                  gamma : float,
+                                  mass : Array,
+                                  mod_potential_params_fn : Callable[[float], ArrayTree], # potential energy protocol,
+                                  mod_kT_fn : Callable[[float], float], # kT protocol (effective temperature)
+                                  shift_fn : jax_md.space.ShiftFn,
+                                  kinetic_energy_fn : Optional[EnergyFn] = kinetic_energy,
+                                  get_shadow_work : Optional[bool] = False):
+    """make an equilibrium simulator"""
+    base_integrator = make_static_BAOAB_kernel(potential_energy_fn = potential_energy_fn,
+                             dt = dt,
+                             gamma = gamma,
+                             mass = mass,
+                             shift_fn = shift_fn,
+                             kinetic_energy_fn = kinetic_energy_fn,
+                             get_shadow_work = get_shadow_work,
+                             )
+
+
+    folded_integrator = make_folded_integrator(integrator = base_integrator,
+                                               mod_potential_params_fn=mod_potential_params_fn,
+                                               mod_kT_fn=mod_kT_fn,
+                                               potential_energy_fn=potential_energy_fn)
+    return folded_integrator

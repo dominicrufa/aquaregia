@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from functools import partial
 from jax import lax, ops, vmap, jit, grad, random
 from jax.scipy.special import logsumexp
+import numpy as np
 
 from jax.config import config
 config.update("jax_enable_x64", True)
@@ -25,10 +26,16 @@ class Graph(NamedTuple): #a NamedTuple object for the graph node (it carries lat
     vs : Array # shape=(N, dim)
     edges : Array # shape=(N,N,edge_features)
 
-def kinetic_energy(V: Array, # velocities in nm ps**{-1}
-                   masses: Array # in daltons)
-                   )-> float: # in kJ mol**(-1)
-    return 0.5 * V.dot(V) / masses
+def kinetic_energy(vs, mass):
+    def ke(_v, _mass):
+        return 0.5 * _v.dot(_v) * _mass
+    return vmap(ke, in_axes=(0,0))(vs, mass).sum()
+
+def normal_kinetic_energy(vs):
+    def ke(vs): #this should be a split
+        return 0.5 * vs.dot(vs)
+    vke = vmap(ke)
+    return vke(vs).sum()
 
 def logZ_from_works(works : Array # reduced works
                    ) -> float: # reduced free energy
@@ -36,6 +43,22 @@ def logZ_from_works(works : Array # reduced works
     N = len(works)
     w_min = jnp.min(works)
     return -(w_min - logsumexp(-works + w_min) + jnp.log(N))
+
+def Bennet_implicit_fn(dF, fwd_works, bkwd_works):
+    forward_term = fwd_works - dF
+    backward_term = bkwd_works + dF
+    return (forward_term - backward_term).sum()
+
+def Bennet_solution(fwd_reduced_works, bkwd_reduced_works):
+    """use Bennet's Acceptance Ratio to compute the solution of two works"""
+    from scipy.optimize import fsolve
+    from aquaregia.utils import logZ_from_works
+
+    p_fn = partial(Bennet_implicit_fn, fwd_works = fwd_reduced_works, bkwd_works = bkwd_reduced_works)
+    init_guess = -logZ_from_works(fwd_reduced_works)
+
+    a = fsolve(p_fn, init_guess)
+    return a[0] 
 
 def ESS(works : Array # reduced works
        ) -> float: # ESS quantity
@@ -74,3 +97,101 @@ def get_normal_test_graph(seed = random.PRNGKey(13),
               vs = random.normal(vs_seed, shape=(num_nodes, dimension)),
               edges = random.normal(edges_seed, shape=(num_nodes, num_nodes, edges_features)))
     return g
+
+def radial_basis(d_ij : float,
+                 mu_ks : Array,
+                 gamma : float) -> Array:
+    """
+    turn a radial distance `d_ij` into a radial basis function with `mu_ks` radial bases
+    and a spread of `gamma`
+
+    Arguments:
+        d_ij : float
+            radial distance
+        mu_ks : Array
+            radial bases of shape (Q,) where Q is the number of radial bases
+        gamma : float
+            spread of radial basis interaction
+    """
+    return jnp.exp(-gamma * (d_ij - mu_ks)**2)
+
+
+
+def compute_atom_centered_fingerprints(mol,
+                                       generator,
+                                       fpSize,
+                                       normalize = True):
+    """
+    compute an atom-centric fingerprint of a molecule. You need `rdkit`
+
+    Arguments:
+    mol : rdkit.Chem.Mol
+    generator : return of `rdFingerprintGenerator.GetCountFingerPrint
+    fpSize : size of fingerprint
+    normalize : reduce so that all output vals are <= 1.
+
+    Return:
+    fingerprints : np.array(mol.GetNumAtoms(), fpSize, dtype=np.float64)
+
+    TODO : fix thee typing (do we need to import `rdkit` here?)
+
+    Example:
+    >>> import rdkit
+    >>> import numpy as np
+    >>> #print(rdkit.__version__)
+    >>> from rdkit import Chem
+    >>> from rdkit.Chem import RDKFingerprint
+    >>> from rdkit.Chem import rdFingerprintGenerator
+    >>> mol = Chem.SDMolSupplier('mol.sdf', removeHs=False)[0] # this assumes you want the 0th mol from an sdf called `mol.sdf`
+    >>> fpSize = 32
+    >>> generator = rdFingerprintGenerator.GetRDKitFPGenerator(minPath=5, maxPath=5, fpSize=fpSize)
+    >>> X = compute_atom_centered_fingerprints(mol, generator, fpSize, normalize=True)
+    """
+    n_atoms = mol.GetNumAtoms()
+    fingerprints = np.zeros((n_atoms, fpSize), dtype=int)
+
+    for i in range(mol.GetNumAtoms()):
+        fingerprint = generator.GetCountFingerprint(mol, fromAtoms=[i])
+        for (key, val) in fingerprint.GetNonzeroElements().items():
+            fingerprints[i, key] = val
+
+    fp = np.array(fingerprints, dtype=np.float64)
+    if normalize:
+        _max = np.max(fp)
+        fp = fp / _max
+
+    return fp
+
+def generate_edges_from_mol(mol, normalize=True):
+    """
+    generate an array of edge features (of 2 features);
+    the features we use are
+    `bond_type` (float) and `is_conjugated` (bool as binary float);
+    nonbonded atoms are zeros.
+
+    Arguments:
+    mol : rdkit.Chem.Mol
+    normalize : reduce so that all output vals are <= 1.
+
+    Return:
+    out_array : np.array of shape (mol.GetNumAtoms, mol.GetNumAtoms, 2)
+
+    NOTE : this has not been stress tested on big molecules/protein sequences
+    """
+    num_atoms = mol.GetNumAtoms()
+    edge_array = np.zeros((num_atoms, num_atoms, 2))
+    for bond in mol.GetBonds():
+        p1, p2 = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        bond_type = bond.GetBondTypeAsDouble()
+        conj_bool = 1. if bond.GetIsConjugated() else 0.
+        lof = np.array([bond_type, conj_bool])
+        edge_array[p1, p2] = lof
+        edge_array[p2, p1] = lof
+
+    if normalize:
+        max_val = np.max(edge_array)
+        out_array = edge_array / max_val
+    else:
+        out_array = edge_array
+
+    return out_array

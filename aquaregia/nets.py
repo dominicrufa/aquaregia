@@ -4,8 +4,6 @@ import flax.linen as nn
 import jax.numpy as jnp
 from functools import partial
 from jax import lax, ops, vmap, jit, grad, random
-from jax.scipy.special import logsumexp
-from matplotlib import pyplot as plt
 
 from jax.config import config
 
@@ -45,26 +43,52 @@ def make_mlp(features : Sequence[int],
         return get_mlp_by_activation(activation)(features)(inputs)
     return update_fn
 
+def scalar_mlp_kernel_init(val : float) -> Callable:
+    return lambda seed, shape: val * jnp.ones(shape)
+
 class ScalarMLP(nn.Module):
     """
     define an mlp that just multiplies the input Array by a scalar.
     This is useful when we want to initialize a normalizing flow close to identity.
     """
-    kernel_init : Callable = partial(random.uniform, minval=1e-2, maxval=2e-2)
+    num : int
+    kernel_init : Callable[[Array, ...], Array]
 
     @nn.compact
     def __call__(self, inputs):
         kernel = self.param('kernel',
                         self.kernel_init, # Initialization function
-                           ())  # shape info.
-        y = (kernel**2) * inputs
+                           ((self.num, 1)))  # shape info.
+        y = kernel * inputs
         return y
 
-def make_scalar_mlp() -> MLPFn:
+def make_scalar_mlp(num, kernel_init) -> MLPFn:
     @jraph.concatenated_args
     def update_fn(inputs):
-        return ScalarMLP()(inputs)
+        return ScalarMLP(num, kernel_init)(inputs)
     return update_fn
+
+"""Here lies a deprecated `ScalarMLP`"""
+# class ScalarMLP(nn.Module):
+#     """
+#     define an mlp that just multiplies the input Array by a scalar.
+#     This is useful when we want to initialize a normalizing flow close to identity.
+#     """
+#     kernel_init : Callable = partial(random.uniform, minval=1e-2, maxval=2e-2)
+#
+#     @nn.compact
+#     def __call__(self, inputs):
+#         kernel = self.param('kernel',
+#                         self.kernel_init, # Initialization function
+#                            ())  # shape info.
+#         y = (kernel**2) * inputs
+#         return y
+
+# def make_scalar_mlp() -> MLPFn:
+#     @jraph.concatenated_args
+#     def update_fn(inputs):
+#         return ScalarMLP()(inputs)
+#     return update_fn
 
 # this should be a util...
 def polynomial_switching_fn(r : Array, r_cutoff : float, r_switch : float) -> float:
@@ -91,21 +115,22 @@ def get_stacked_mat_from_vector(vec : Array)-> Array:
     return jnp.concatenate([swapped_tiled_vec,tiled_vec], axis=-1)
 
 def make_default_message_fn(mlp_e : MLPFn, # mlp_e : R^{2*nf_h + 1 + 1} -> R^{nf_m}
-                            displacement_or_metric : space.DisplacementOrMetricFn) -> Callable[[Graph], ArrayTree]:
+                            displacement_or_metric : space.DisplacementOrMetricFn,
+                            rbf_kwargs : Optional[ArrayTree] = {'mu_ks' : jnp.linspace(0,1,16), 'gamma' : 1.}) -> Callable[[Graph], ArrayTree]:
     """
     function that returns a GNMessageFn (i.e. Eq.3)
     TODO : add support for decaying coupling fn for messages!
     """
+    from aquaregia.utils import radial_basis
+    rbf = partial(radial_basis, **rbf_kwargs)
     vmetric = vmap(vmap(space.canonicalize_displacement_or_metric(displacement_or_metric), in_axes = (None,0)), (0, None))
-
 
     def gn_message_fn(xs, hs, edges):
         N = xs.shape[0]
-        unmasked_square_distances = jnp.power(vmetric(xs, xs), 2)
-        square_distances = unmasked_square_distances[..., jnp.newaxis]
-        #square_distances = ops.index_update(unmasked_square_distances, ops.index[jnp.diag_indices(xs.shape[0])], 0.)
+        distances = vmetric(xs, xs)[..., jnp.newaxis] # make a new axis so we can push to rbf
+        rbs = jnp.apply_along_axis(rbf, axis=2, arr=distances)
         received_sent_hs = get_stacked_mat_from_vector(hs)
-        messages = mlp_e(received_sent_hs, square_distances, edges) # are edges a symmetric matrix?
+        messages = mlp_e(received_sent_hs, rbs, edges) # are edges a symmetric matrix?
         return messages
 
     return gn_message_fn
@@ -140,7 +165,8 @@ def make_velocity_RNVP_fns(message_fn,
                            displacement_fn,
                            shift_fn,
                            C,
-                           use_vs_make_scalars = False):
+                           use_vs_make_scalars = False,
+                           make_scalars_vals = {'update_xs': 1e-6, 'velocity_t_fn': 1e-6, 'velocity_log_s_fn': 1e-6}):
     """create a function that will make the scalar shift update vectors for velocity from positions (and graph hs, edges).
        critically, the output is exclusively a function of xs and immutable graph attributes.
 
@@ -159,10 +185,20 @@ def make_velocity_RNVP_fns(message_fn,
 
     vmetric = vmap(vmap(space.canonicalize_displacement_or_metric(displacement_fn), in_axes = (None,0)), (0, None))
     vdisplacement = vmap(vmap(displacement_fn, in_axes = (None,0)), (0, None))
-    i_fn = lambda x: x
 
-    log_s_make_scalar = make_scalar_mlp() if use_vs_make_scalars else i_fn
-    t_make_scalar = make_scalar_mlp() if use_vs_make_scalars else i_fn
+    make_scalars_vals_keys = list(make_scalars_vals.keys())
+
+    assert 'update_xs' in make_scalars_vals_keys
+
+    if use_vs_make_scalars:
+        assert 'velocity_t_fn' in make_scalars_vals_keys
+        assert 'velocity_log_s_fn' in make_scalars_vals_keys
+
+    # sort out the make
+    i_fn = lambda x: x
+    def get_i_fn(*args, **kwargs) : return i_fn
+    log_s_make_scalar = make_scalar_mlp if use_vs_make_scalars else get_i_fn
+    t_make_scalar = make_scalar_mlp if use_vs_make_scalars else get_i_fn
 
     # default loaders
     def update_vs(vs, ts, log_s):
@@ -177,7 +213,8 @@ def make_velocity_RNVP_fns(message_fn,
         a scalar mlp is just a function that multiplies the input by a (trainable) scalar. this is because at the start of training,
         we want the transformation to be close to identity.
         """
-        return shift_fn(xs, make_scalar_mlp()(vs))
+        return shift_fn(xs,
+                        make_scalar_mlp(num = vs.shape[0], kernel_init = scalar_mlp_kernel_init(val=make_scalars_vals['update_xs'])) (vs))
 
     def message_and_hs_fn(xs, hs, edges):
         # first thing to do is create messages
@@ -202,12 +239,12 @@ def make_velocity_RNVP_fns(message_fn,
         summands = aug_normalized_x_distances * mlp_messages
         summands = ops.index_update(summands, ops.index[jnp.diag_indices(num_positions)], jnp.zeros(dimension))
         updated_vectors = jnp.sum(summands, axis=1)
-        updated_vectors = t_make_scalar(updated_vectors)
+        updated_vectors = t_make_scalar(num = xs.shape[0], kernel_init = scalar_mlp_kernel_init(val=make_scalars_vals['velocity_t_fn']))(updated_vectors)
         return updated_vectors
 
     def velocity_log_s_fn(hs, dimension):
         log_multipliers = mlp_v(hs) #compute log multipliers
-        log_multipliers = log_s_make_scalar(log_multipliers) # multiply this by a scalar if we need
+        log_multipliers = log_s_make_scalar(num = hs.shape[0], kernel_init = scalar_mlp_kernel_init(val=make_scalars_vals['velocity_log_s_fn']))(log_multipliers) # multiply this by a scalar if we need
         tiled_multipliers = dimension * log_multipliers
         logdetJ = tiled_multipliers.sum() #this is a single summation
         return log_multipliers, logdetJ
@@ -264,6 +301,7 @@ def make_RNVP_module(graph : Graph,
                      seed : Optional[Array] = random.PRNGKey(13),
                      C : Optional[float] = 1.,
                      use_vs_make_scalars : Optional[bool] = False,
+                     make_scalars_vals : Optional[ArrayTree] = {'update_xs': 1e-6, 'velocity_t_fn': 1e-6, 'velocity_log_s_fn': 1e-6},
                      num_VRV_repeats : Optional[int] = 1,
 
                      # optional activation fns
@@ -272,17 +310,19 @@ def make_RNVP_module(graph : Graph,
                      h_fn_activation: Optional[MLPFn] = nn.relu,
                      mlp_x_activation : Optional[MLPFn] = nn.swish,
                      mlp_v_activation : Optional[MLPFn] = nn.swish,
+                     message_rbf_kwargs : Optional[ArrayTree] = {'mu_ks' : jnp.linspace(0,1,16), 'gamma' : 1.}
                     ):
     # make RNVP_wrapper
-    RNVP_wrapper = make_velocity_RNVP_fns(message_fn = make_default_message_fn(mlp_e = make_mlp(message1_fn_features, message1_fn_activation), displacement_or_metric=displacement_fn),
+    RNVP_wrapper = make_velocity_RNVP_fns(message_fn = make_default_message_fn(mlp_e = make_mlp(message1_fn_features, message1_fn_activation), displacement_or_metric=displacement_fn, rbf_kwargs = message_rbf_kwargs),
                                           h_fn = make_default_update_h_fn(mlp_h=make_mlp(h_fn_features, h_fn_activation)),
-                                          passable_message_fn = make_default_message_fn(mlp_e = make_mlp(message1_fn_features, message1_fn_activation), displacement_or_metric=displacement_fn),
+                                          passable_message_fn = make_default_message_fn(mlp_e = make_mlp(message1_fn_features, message1_fn_activation), displacement_or_metric=displacement_fn, rbf_kwargs = message_rbf_kwargs),
                                           mlp_x = make_mlp(mlp_x_features, mlp_x_activation),
                                           mlp_v = make_mlp(mlp_v_features, mlp_v_activation),
                                           displacement_fn = displacement_fn,
                                           shift_fn = shift_fn,
                                           C = C,
-                                          use_vs_make_scalars=use_vs_make_scalars)
+                                          use_vs_make_scalars=use_vs_make_scalars,
+                                          make_scalars_vals=make_scalars_vals)
 
     # pull the graph apart
     hs, _xs, _vs, edges = graph # pull out the graph
