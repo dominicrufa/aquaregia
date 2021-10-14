@@ -5,7 +5,7 @@ from aquaregia.integrators import *
 
 from openmmtools.testsystems import Diatom
 from aquaregia.openmm import make_canonical_energy_fn
-from aquaregia.utils import kinetic_energy
+from aquaregia.utils import kinetic_energy, get_vacuum_neighbor_list
 import tqdm
 
 # Constants
@@ -24,8 +24,10 @@ def get_diatom_parameters_dict():
     xs, vs = Array(diatom.positions.value_in_unit_system(unit.md_unit_system), dtype=jnp.float64), thermalize(seed = random.PRNGKey(263), masses=masses, kT = kT, dimension=3)
 
     u_params, u_fn = make_canonical_energy_fn(system=system,
-                                              displacement_fn=displacement_fn,
-                                              fix_parameters=False)
+                                              displacement_fn=displacement_fn)
+
+    vacuum_neighbor_list = get_vacuum_neighbor_list(system.getNumParticles())
+    neighbor_fn = lambda x, y: vacuum_neighbor_list
 
     _dict = {'displacement_fn': displacement_fn,
              'shift_fn': shift_fn,
@@ -33,12 +35,18 @@ def get_diatom_parameters_dict():
              'u_params': u_params,
              'masses': masses,
              'xs': xs,
-             'vs': vs}
+             'vs': vs,
+             'neighbor_fn' : neighbor_fn,
+             'neighbor_list' : vacuum_neighbor_list
+             }
 
     return _dict
 
 
-def get_diatom_equilibrium_cache(seed = random.PRNGKey(455), _dict = get_diatom_parameters_dict(), num_samples=500, steps_per_sample=50):
+def get_diatom_equilibrium_cache(seed = random.PRNGKey(455),
+                                 _dict = get_diatom_parameters_dict(),
+                                 num_samples=500,
+                                 steps_per_sample=50):
     """
     run equilibrium integrator of diatom. returns equilibrium positions, velocities
     """
@@ -51,14 +59,15 @@ def get_diatom_equilibrium_cache(seed = random.PRNGKey(455), _dict = get_diatom_
 
     #make the integrator
     integrator = get_folded_equilibrium_integrator(potential_energy_fn = u_fn,
-                                      potential_energy_parameters = u_params,
-                                      kT = kT,
-                                      dt = DEFAULT_TIMESTEP,
-                                      gamma = 1.,
-                                      mass = masses,
-                                      shift_fn = shift_fn,
-                                      kinetic_energy_fn = kinetic_energy,
-                                      get_shadow_work = False)
+                                                   neighbor_fn = _dict['neighbor_fn'],
+                                                   potential_energy_parameters = u_params,
+                                                   kT = kT,
+                                                   dt = DEFAULT_TIMESTEP,
+                                                   gamma = 1.,
+                                                   mass = masses,
+                                                   shift_fn = shift_fn,
+                                                   kinetic_energy_fn = kinetic_energy,
+                                                   get_shadow_work = False)
     jax_int = jit(integrator)
     jkinetic_energy = jit(kinetic_energy)
 
@@ -68,7 +77,7 @@ def get_diatom_equilibrium_cache(seed = random.PRNGKey(455), _dict = get_diatom_
     #seed = random.PRNGKey(455)
     for i in tqdm.trange(num_samples):
         seed, run_seed = random.split(seed)
-        xs, vs, _ = jax_int(xs, vs, start_pe=0., seed=run_seed, sequence=jnp.arange(steps_per_sample))
+        xs, vs, _, _ = jax_int(xs, vs, neighbor_list = _dict['neighbor_list'], start_pe=0., seed=run_seed, sequence=jnp.arange(steps_per_sample))
         dx = metric(xs[0], xs[1])
         ke = jkinetic_energy(vs, masses)
         displacements.append(dx)
@@ -80,7 +89,7 @@ def get_diatom_equilibrium_cache(seed = random.PRNGKey(455), _dict = get_diatom_
 def test_folded_equilibrium_integrator():
     """
     run an equilibrium simulation on a diatomic species and assert kinetic energy
-    and displacement statistics are close to analytical value
+    and displacement statistics are close to analytical value.
     """
     diatom = Diatom()
     displacement_std = jnp.sqrt((1. / diatom.K).value_in_unit_system(unit.md_unit_system))
@@ -102,8 +111,21 @@ def test_folded_equilibrium_integrator():
     assert measured_mean_ke > mean_ke - ke_bound
     assert measured_mean_ke < mean_ke + ke_bound
 
+def test_vacuum_equilibrium_integration():
+    """
+    run a short simulation of AlanineDipeptideVacuum
+    """
+    pass
 
-def test_forward_nonequilibrium_integrator():
+def test_periodic_equilibrium_integration():
+    """
+    run a short simulation of AlanineDipeptideExplicit.
+    This test is relevant because it must show we are manipulating the neighbor_list appropriately through the folded integrator.
+    """
+    pass
+
+#this is not being tested atm.
+def forward_nonequilibrium_integrator_test():
     """
     do a simple test on a nonequilibrium integrator to show that we improve logZ estimate over IW when performing
     AIS. Also show that the bias decreases.

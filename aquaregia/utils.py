@@ -7,6 +7,7 @@ from functools import partial
 from jax import lax, ops, vmap, jit, grad, random
 from jax.scipy.special import logsumexp
 import numpy as np
+from jax_md.partition import NeighborList
 
 from jax.config import config
 config.update("jax_enable_x64", True)
@@ -14,7 +15,7 @@ config.update("jax_enable_x64", True)
 # Typing
 Array = jnp.array
 from jraph._src.utils import ArrayTree
-EnergyFn = Callable[[Array, ArrayTree, ...], float]
+EnergyFn = Callable[[Array, ...], float]
 
 # E(n)-Equivariant Graph Fns
 class Graph(NamedTuple): #a NamedTuple object for the graph node (it carries latent features hs, positions xs, and velocities vs)
@@ -25,6 +26,17 @@ class Graph(NamedTuple): #a NamedTuple object for the graph node (it carries lat
     xs : Array # shape=(N, dim)
     vs : Array # shape=(N, dim)
     edges : Array # shape=(N,N,edge_features)
+
+def get_vacuum_neighbor_list(num_particles : int) -> NeighborList:
+    vacuum_neighbor_list_idx = jnp.transpose(jnp.repeat(jnp.arange(num_particles, dtype=jnp.int64)[..., jnp.newaxis], repeats = num_particles, axis=-1))
+    back_diag = jnp.diag(num_particles - jnp.diag(vacuum_neighbor_list_idx))
+    vacuum_neighbor_list = NeighborList(idx = vacuum_neighbor_list_idx + back_diag,
+                                        reference_position=None,
+                                        did_buffer_overflow=False,
+                                        max_occupancy=0.,
+                                        cell_list_fn=None)
+    return vacuum_neighbor_list
+
 
 def kinetic_energy(vs, mass):
     def ke(_v, _mass):
@@ -58,7 +70,7 @@ def Bennet_solution(fwd_reduced_works, bkwd_reduced_works):
     init_guess = -logZ_from_works(fwd_reduced_works)
 
     a = fsolve(p_fn, init_guess)
-    return a[0] 
+    return a[0]
 
 def ESS(works : Array # reduced works
        ) -> float: # ESS quantity

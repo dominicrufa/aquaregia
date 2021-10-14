@@ -26,14 +26,17 @@ def vacuum_energy_canonicalization_test(testsystem : openmm.System,
     #make parameter dict and energy fn
     out_params, energy_fn = make_canonical_energy_fn(testsystem,
                              disp,
-                             nonbonded_kwargs = {},
-                             fix_parameters = False)
+                             kwargs_dict = {})
 
     jenergy_fn = jit(energy_fn)
 
+    #grab a vacuum neighbor list
+    from aquaregia.utils import get_vacuum_neighbor_list
+    vacuum_neighbor_list = get_vacuum_neighbor_list(num_particles = testsystem.getNumParticles())
+
     # get jax energy
-    jax_e = jenergy_fn(positions.value_in_unit_system(unit.md_unit_system), out_params)
-    jax_f = -1. * grad(energy_fn)(positions.value_in_unit_system(unit.md_unit_system), out_params)
+    jax_e = jenergy_fn(positions.value_in_unit_system(unit.md_unit_system), vacuum_neighbor_list, out_params)
+    jax_f = -1. * grad(energy_fn)(positions.value_in_unit_system(unit.md_unit_system), vacuum_neighbor_list, out_params)
 
     # get openmm energy
     integrator = openmm.VerletIntegrator(1.0 * unit.femtoseconds)
@@ -82,4 +85,10 @@ def test_vacuum_energy_canonicalizations():
     for i in tqdm.trange(len(instances)):
         testsys_instance = instances[i]
         get_cleaned_vacuum_system(testsys_instance)
-        vacuum_energy_canonicalization_test(testsys_instance.system, testsys_instance.positions)    
+        vacuum_energy_canonicalization_test(testsys_instance.system, testsys_instance.positions)
+
+def test_explicit_energy_canonicalization():
+    """do a jax energy assertion test for AlanineDipeptideExplicit, HostGuestExplicit"""
+    # we have discrepant energies in electrostatics energy
+    # also be sure to turn off dispersion correction and _only_ take the direct space PME energy.
+    pass

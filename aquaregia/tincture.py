@@ -292,7 +292,10 @@ def retrieve_periodic_edge_array(neighbor_list, edges):
     masked_indices = jnp.where(neighbor_list.idx != num_hs, neighbor_list.idx, 0)
     return jnp.take_along_axis(edges, masked_indices, axis=1)
 
-
+def get_mask(neighbor_list):
+    num_particles, max_neighbors = neighbor_list.idx.shape
+    mask = neighbor_list.idx != num_particles
+    return mask
 
 def make_message_fn(mlp_e : MLPFn, # mlp_e : R^{2*nf_h + 1 + 1} -> R^{nf_m}
                              neighbor_fn,
@@ -303,56 +306,31 @@ def make_message_fn(mlp_e : MLPFn, # mlp_e : R^{2*nf_h + 1 + 1} -> R^{nf_m}
     """
     """
     hs_len, hs_feature_size = hs.shape
-    periodic = False if neighbor_fn is None else True
-    vacuum_mask = Array(jnp.ones((hs_len, hs_len)) - jnp.eye(hs_len), dtype=jnp.bool_)
 
     if edges is not None:
         assert edges.shape == (hs_len, hs_len)
-
-
-    if periodic:
-        pass_neighbor_fn = lambda x, y: neighbor_fn(x,y)
-        stack_hs_to_nbr_matrix = partial(get_periodic_stacked_mat_from_vector, hs = hs) #stack hs
-        if edges is None:
-            get_message_edges = lambda neighbor_list : jnp.zeros_like(neighbor_list.idx)
-        else:
-            get_message_edges = partial(retrieve_periodic_edge_array, edges = edges)
-
-        def get_mask(neighbor_list):
-            num_particles, max_neighbors = neighbor_list.idx.shape
-            mask = neighbor_list.idx != num_particles
-            return mask
-
+        get_message_edges = partial(retrieve_periodic_edge_array, edges = edges)
     else:
-        pass_neighbor_fn = lambda x, y: None
-        stack_hs_to_nbr_matrix = partial(get_stacked_mat_from_vector, hs = hs) #stack hs
-        if edges is None:
-            get_message_edges = lambda neighbor_list : jnp.zeros((hs_len, hs_len))
-        else:
-            get_message_edges = lambda neighbor_list : edges
+        get_message_edges = lambda neighbor_list : jnp.zeros_like(neighbor_list.idx)
 
-        def get_mask(neighbor_list): return vacuum_mask
-
-
+    stack_hs_to_nbr_matrix = partial(get_periodic_stacked_mat_from_vector, hs = hs) #stack hs
 
     def gn_message_fn(xs, neighbor_list):
         N, dim = xs.shape
 
         #WARNING : we might have to forego this fn and just throw out the result if there is a buffer overflow
-        _nbrs = pass_neighbor_fn(x = xs, y = neighbor_list)
+        _nbrs = neighbor_fn(xs, neighbor_list)
         mask = get_mask(_nbrs)
 
         displacements = v_displacement_fn(xs = xs, neighbor_list = _nbrs)
         masked_displacements = jnp.where(jnp.repeat(mask[..., jnp.newaxis], repeats = dim, axis=-1), displacements, 0.)
         distances_squared = (displacements**2).sum(axis=2)[..., jnp.newaxis]
 
-
         # compute radial basis features
 #         rbs = jnp.apply_along_axis(smooth_distance_featurizer, axis=2, arr=distances)
 
         #compute message_edges
         message_edges = get_message_edges(neighbor_list = _nbrs)[..., jnp.newaxis] #add a new axis so we can pass to mpl_e
-
 
         # compute the unmasked messages (no edge information)
         in_hs = stack_hs_to_nbr_matrix(neighbor_list=_nbrs)
@@ -390,16 +368,9 @@ def make_periodic_log_s_fn(dimension, mlp_v, scalar_multiplier):
 def get_periodic_v_displacement_fn(displacement_fn):
     return vmap(vmap(displacement_fn, in_axes=(None, 0)))
 
-def get_vacuum_v_displacement_fn(displacement_fn):
-    return vmap(vmap(displacement_fn, in_axes = (None,0)), (0, None))
-
-def get_v_displacement_fn(displacement_fn, periodic):
-    if periodic:
-        vdisp = get_periodic_v_displacement_fn(displacement_fn)
-        out_vdisp = lambda xs, neighbor_list : vdisp(xs, xs[neighbor_list.idx])
-    else:
-        vdisp = get_vacuum_v_displacement_fn(displacement_fn)
-        out_vdisp = lambda xs, neighbor_list : vdisp(xs, xs)
+def get_v_displacement_fn(displacement_fn):
+    vdisp = get_periodic_v_displacement_fn(displacement_fn)
+    out_vdisp = lambda xs, neighbor_list : vdisp(xs, xs[neighbor_list.idx])
     return out_vdisp
 
 def make_periodic_t_fn(mlp_x,
@@ -500,6 +471,10 @@ class GraphRNVP(object):
             assert jnp.all(0.5 * self._box_vectors > self._r_cutoff), f"cutoff distance cannot be greater than half the periodic box size"
         else:
             assert self._r_cutoff is None, f"vacuum simulations necessitate no cutoffs"
+            from aquaregia.utils import get_vacuum_neighbor_list
+            num_particles = self.hs.shape[0]
+            vacuum_neighbor_list = get_vacuum_neighbor_list(num_particles)
+            self._neighbor_fn = lambda x, y: vacuum_neighbor_list
 
     def _get_space_attributes(self):
         if self._periodic:
@@ -526,7 +501,7 @@ class GraphRNVP(object):
                                   scalar_multiplier = self._log_s_scalar)
 
     def _set_v_displacement_fn(self, neighbor_list):
-        self._v_displacement_fn = get_v_displacement_fn(displacement_fn=self._displacement_fn, periodic=self._periodic)
+        self._v_displacement_fn = get_v_displacement_fn(displacement_fn=self._displacement_fn)
 
 
     def _get_t_fn(self, base_neighbor_list):
