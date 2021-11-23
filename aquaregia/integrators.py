@@ -31,7 +31,7 @@ def metropolize_bool(reduced_work : float, # unitless
                      seed: Array # random seed
                      ) -> bool:
     """from a (unitless) work value and a seed, return accept/reject"""
-    log_acceptance_prob = jnp.min(Array([0., -work]))
+    log_acceptance_prob = jnp.min(Array([0., -reduced_work]))
     lu = jnp.log(random.uniform(seed))
     accept = (lu <= log_acceptance_prob)
     return accept
@@ -70,7 +70,7 @@ def make_static_BAOAB_kernel(potential_energy_fn : EnergyFn,
                              mass : Array,
                              shift_fn : jax_md.space.ShiftFn,
                              kinetic_energy_fn : Optional[EnergyFn] = kinetic_energy,
-                             get_shadow_work : Optional[bool] = False,
+                             get_shadow_work : Optional[Union[bool, str]] = False,
                              ) -> Callable[Tuple[Array, Array, Array, ArrayTree, float], Tuple[Array, Array, float]]:
     """
     function that returns a static BAOAB kernel
@@ -87,12 +87,17 @@ def make_static_BAOAB_kernel(potential_energy_fn : EnergyFn,
     partial_O_update = partial(O_update, mass = mass, a = a, b = b)
     partial_ke = partial(kinetic_energy_fn, mass = mass)
 
-    if get_shadow_work:
+    if get_shadow_work is True:
         ke_fn = partial_ke
         pe_fn = potential_energy_fn
-    else:
+    elif get_shadow_work is False:
         ke_fn = lambda x: 0.
         pe_fn = lambda x, y, z: 0. # this now generically takes 3 args
+    elif get_shadow_work == 'heat': # return the kinetic energy work of the step
+        ke_fn = partial_ke
+        pe_fn = lambda x, y, z: 0.
+    else:
+        raise ValueError(f"the argument {get_shadow_work} is not supported")
 
     def run(xs : Array,
             vs : Array,

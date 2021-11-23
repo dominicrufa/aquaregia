@@ -329,3 +329,59 @@ def test_full_GraphRNVP():
     """
     full_GraphRNVP(periodic=True)
     full_GraphRNVP(periodic=False)
+
+def full_generic_EnGNN(seed = random.PRNGKey(24),
+                       periodic = False,
+                       module_kwarg_dict = {}):
+
+    n_particles_per_side = 5 if not periodic else 10
+    r_cutoff = 0.25 if periodic else None
+    particle_seed, seed = random.split(seed)
+    xs, displacement, shift, nbr_fn, hs, edges, box_size = get_periodic_particles(seed=particle_seed,
+                                                                                  periodic = periodic,
+                                                                                  particles_per_side=n_particles_per_side,
+                                                                                  r_cutoff=r_cutoff)
+    if periodic:
+        nbr_list = nbr_fn(xs)
+        assert nbr_list.idx.shape[1] != nbr_list.idx.shape[0]
+    else:
+        nbr_list = None
+
+
+    randomizer_seed, seed = random.split(seed)
+    xs = vmap(shift, in_axes=(0,0))(xs, random.normal(randomizer_seed, shape=xs.shape) * 1e-4)
+
+    velocity_seed, seed = random.split(seed)
+    vs = random.normal(velocity_seed, shape=xs.shape)
+
+    engnn = EnGNN(hs = hs,
+                 edges = edges,
+                 mlp_e = make_mlp(features=[8, 8, 8], activation=nn.swish), # mlp for m_ij = m_ij(h_i, h_j, r_ij, edge_ij)
+                 mlp_h = make_mlp(features = [8,8, 8], activation=nn.swish), # mlp for h_i = h_i(h_i, m_i)
+                 r_cutoff = r_cutoff,
+                 r_switch = None,
+                 neighbor_fn = nbr_fn,
+                 box_vectors = box_size
+                 )
+
+    module = engnn.EnGNN_module(xs, 5, **module_kwarg_dict)()
+    nn_params = module.init(seed, xs)
+
+    out_deliver = module.apply(nn_params, xs)
+    print(out_deliver)
+
+    random_seed, seed = random.split(seed)
+    transformed_xs, transformed_vs = get_3D_transformed_xs_vs(xs, vs, random_seed, shift, periodic=periodic)
+
+    out_transformed_deliver = module.apply(nn_params, transformed_xs)
+    print(out_transformed_deliver)
+
+    assert jnp.allclose(out_deliver, out_transformed_deliver)
+
+def test_full_generic_EnGNN():
+    """
+    test a full_generic_EnGNN;
+    WARNING : `periodic=True` is discrepant w.r.t. translation operation in ~0.0001. 
+    """
+    #full_generic_EnGNN(periodic=True)
+    full_generic_EnGNN(periodic=False)

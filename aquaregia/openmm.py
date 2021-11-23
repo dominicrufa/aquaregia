@@ -432,9 +432,11 @@ def make_canonical_energy_fn(system : openmm.System,
 def make_scale_system(system : openmm.System,
                       target_ps : Sequence[int],
                       remove_angles : Optional[bool] = True,
+                      remove_torsions : Optional[bool] = True,
                       nb_scale_factor : Optional[float] = 1e-3,
                       scale_electrostatics : Optional[bool] = True,
-                      scale_sterics : Optional[bool] = True) -> openmm.System:
+                      scale_sterics : Optional[bool] = True,
+                      scale_exceptions : Optional[bool] = True) -> openmm.System:
     """
     make a deecopy of a system and scale the torsion, nb, and nb_exception parameters of all terms containing `target_ps`.
     optionally scale angles, as well
@@ -460,12 +462,13 @@ def make_scale_system(system : openmm.System,
 
 
     # torsions
-    for torsion_idx in range(torsion_f.getNumTorsions()):
-        torsion_parameters = torsion_f.getTorsionParameters(torsion_idx)
-        torsion_param_set = set(torsion_parameters[:4])
-        per, phase, k = torsion_parameters[4:]
-        if torsion_param_set.issubset(target_ps_set):
-            torsion_f.setTorsionParameters(torsion_idx, *torsion_parameters[:4], per, phase, k * 0.)
+    if remove_torsions:
+        for torsion_idx in range(torsion_f.getNumTorsions()):
+            torsion_parameters = torsion_f.getTorsionParameters(torsion_idx)
+            torsion_param_set = set(torsion_parameters[:4])
+            per, phase, k = torsion_parameters[4:]
+            if torsion_param_set.issubset(target_ps_set):
+                torsion_f.setTorsionParameters(torsion_idx, *torsion_parameters[:4], per, phase, k * 0.)
 
     # nonbondeds
     for p_idx in range(nbf.getNumParticles()):
@@ -476,11 +479,12 @@ def make_scale_system(system : openmm.System,
             nbf.setParticleParameters(p_idx, scaled_charge, sigma, scaled_epsilon)
 
     #nonbonded exceptions
-    for nonbonded_exception_idx in range(nbf.getNumExceptions()):
-        p1, p2, chargeProd, sigma, eps = nbf.getExceptionParameters(nonbonded_exception_idx)
-        scaled_chargeProd = chargeProd * nb_scale_factor if scale_electrostatics else chargeProd
-        scaled_epsilon = eps * nb_scale_factor if scale_sterics else eps
-        if {p1, p2}.issubset(target_ps_set):
-            nbf.setExceptionParameters(nonbonded_exception_idx, p1, p2, scaled_chargeProd, sigma, scaled_epsilon)
+    if scale_exceptions:
+        for nonbonded_exception_idx in range(nbf.getNumExceptions()):
+            p1, p2, chargeProd, sigma, eps = nbf.getExceptionParameters(nonbonded_exception_idx)
+            scaled_chargeProd = chargeProd * nb_scale_factor if scale_electrostatics else chargeProd
+            scaled_epsilon = eps * nb_scale_factor if scale_sterics else eps
+            if {p1, p2}.issubset(target_ps_set):
+                nbf.setExceptionParameters(nonbonded_exception_idx, p1, p2, scaled_chargeProd, sigma, scaled_epsilon)
 
     return out_system

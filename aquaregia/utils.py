@@ -80,6 +80,11 @@ def ESS(works : Array # reduced works
     ESS = 1. / jnp.sum(Ws**2) / len(works)
     return ESS
 
+def weights_from_works(works):
+    min_works = jnp.min(works)
+    log_denom = min_works + logsumexp(-works  - min_works)
+    return jnp.exp(-works - log_denom)
+
 def make_test_graph(seed=random.PRNGKey(13), num_nodes=10, h_features=5, dimensions=3, edge_features=4, hs = None):
     """deprecated"""
     xseed, vseed, nodes_seed, edges_seed = random.split(seed, num=4) #split the seed for xseed and vseed
