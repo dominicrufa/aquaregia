@@ -28,13 +28,16 @@ class Graph(NamedTuple): #a NamedTuple object for the graph node (it carries lat
     edges : Array # shape=(N,N,edge_features)
 
 def get_vacuum_neighbor_list(num_particles : int) -> NeighborList:
+    from jax_md.partition import NeighborListFormat
     vacuum_neighbor_list_idx = jnp.transpose(jnp.repeat(jnp.arange(num_particles, dtype=jnp.int64)[..., jnp.newaxis], repeats = num_particles, axis=-1))
     back_diag = jnp.diag(num_particles - jnp.diag(vacuum_neighbor_list_idx))
     vacuum_neighbor_list = NeighborList(idx = vacuum_neighbor_list_idx + back_diag,
                                         reference_position=None,
                                         did_buffer_overflow=False,
                                         max_occupancy=0.,
-                                        cell_list_fn=None)
+                                        format = NeighborListFormat.Dense,
+                                        update_fn = None,
+                                        cell_list=None) #why we need this arg?
     return vacuum_neighbor_list
 
 

@@ -7,6 +7,7 @@ from openmmtools.testsystems import Diatom
 from aquaregia.openmm import make_canonical_energy_fn
 from aquaregia.utils import kinetic_energy, get_vacuum_neighbor_list
 import tqdm
+import pytest
 
 # Constants
 DEFAULT_TEMPERATURE = 300. #kelvin
@@ -125,6 +126,7 @@ def test_periodic_equilibrium_integration():
     pass
 
 #this is not being tested atm.
+@pytest.mark.skip(reason="this is advanced and unnecessary at the moment.")
 def forward_nonequilibrium_integrator_test():
     """
     do a simple test on a nonequilibrium integrator to show that we improve logZ estimate over IW when performing

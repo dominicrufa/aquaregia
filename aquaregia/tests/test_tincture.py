@@ -23,7 +23,8 @@ def get_periodic_particles(seed = random.PRNGKey(3246),
                            dr_threshold = 0.,
                            capacity_multiplier = 1.25,
                            edges_maxval = 2,
-                           dimension = 3
+                           dimension = 3,
+                           neighbor_list_format = partition.NeighborListFormat.Dense
                           ):
     assert dimension in [2,3], f"we do not currently support that sized dimension"
 
@@ -53,9 +54,11 @@ def get_periodic_particles(seed = random.PRNGKey(3246),
                       box_size = box_size,
                       r_cutoff = r_cutoff,
                       dr_threshold = dr_threshold,
-                      capacity_multiplier = capacity_multiplier)
+                      capacity_multiplier = capacity_multiplier,
+                      format = neighbor_list_format)
     else:
-        nbr_fn = None
+        from jax_md.partition import NeighborListFns
+        nbr_fn = NeighborListFns(allocate = None, update = None)
 
     edges = Array(random.randint(edges_seed, shape = (num_particles, num_particles), minval=0, maxval=edges_maxval + 1), dtype=jnp.float64)
     edges = (edges + jnp.transpose(edges))/2
@@ -77,7 +80,7 @@ def hs_and_messages_fn(seed = random.PRNGKey(733),
                                                                                   r_cutoff=r_cutoff)
 
     if periodic:
-        nbr_list = nbr_fn(xs)
+        nbr_list = nbr_fn.allocate(xs)
         assert nbr_list.idx.shape[1] != nbr_list.idx.shape[0]
     else:
         nbr_list = None
@@ -101,7 +104,8 @@ def hs_and_messages_fn(seed = random.PRNGKey(733),
                  dt_scalar = 1.,
                  r_cutoff = r_cutoff,
                  r_switch = None,
-                 neighbor_fn = nbr_fn,
+                 allocate_neighbor_fn = nbr_fn.allocate,
+                 neighbor_fn = nbr_fn.update,
                  box_vectors = box_size
                  )
 
@@ -151,7 +155,7 @@ def graph_position_velocity_updates(seed = random.PRNGKey(8581),
                                                                                   r_cutoff=r_cutoff)
 
     if periodic:
-        nbr_list = nbr_fn(xs)
+        nbr_list = nbr_fn.allocate(xs)
         assert nbr_list.idx.shape[1] != nbr_list.idx.shape[0]
     else:
         nbr_list = None
@@ -178,7 +182,8 @@ def graph_position_velocity_updates(seed = random.PRNGKey(8581),
                  dt_scalar = 1.,
                  r_cutoff = r_cutoff,
                  r_switch = None,
-                 neighbor_fn = nbr_fn,
+                 allocate_neighbor_fn = nbr_fn.allocate,
+                 neighbor_fn = nbr_fn.update,
                  box_vectors = box_size
                  )
 
@@ -215,8 +220,8 @@ def graph_position_velocity_updates(seed = random.PRNGKey(8581),
     assert jnp.allclose(xout_transformed_vs, xout_transformed_vs)
 
     if periodic:
-        out_xs_nbr_list = nbr_fn(vout_xs, nbr_list)
-        out_transformed_nbr_list = nbr_fn(vout_transformed_xs, nbr_list)
+        out_xs_nbr_list = nbr_fn.update(vout_xs, nbr_list)
+        out_transformed_nbr_list = nbr_fn.update(vout_transformed_xs, nbr_list)
         assert not out_xs_nbr_list.did_buffer_overflow
         assert not out_transformed_nbr_list.did_buffer_overflow
 
@@ -244,7 +249,7 @@ def full_GraphRNVP(seed = random.PRNGKey(234),
                                                                                   spacing=0.1)
 
     if periodic:
-        nbr_list = nbr_fn(xs)
+        nbr_list = nbr_fn.allocate(xs)
         assert nbr_list.idx.shape[1] != nbr_list.idx.shape[0]
 
     else:
@@ -269,11 +274,12 @@ def full_GraphRNVP(seed = random.PRNGKey(234),
                  dt_scalar = 1.,
                  r_cutoff = r_cutoff,
                  r_switch = None,
-                 neighbor_fn = nbr_fn,
+                 allocate_neighbor_fn = nbr_fn.allocate,
+                 neighbor_fn = nbr_fn.update,
                  box_vectors = box_size
                  )
     if periodic:
-        nbr_list = nbr_fn(xs)
+        nbr_list = nbr_fn.allocate(xs)
         assert nbr_list.idx.shape[1] != nbr_list.idx.shape[0]
 
     else:
@@ -342,7 +348,7 @@ def full_generic_EnGNN(seed = random.PRNGKey(24),
                                                                                   particles_per_side=n_particles_per_side,
                                                                                   r_cutoff=r_cutoff)
     if periodic:
-        nbr_list = nbr_fn(xs)
+        nbr_list = nbr_fn.allocate(xs)
         assert nbr_list.idx.shape[1] != nbr_list.idx.shape[0]
     else:
         nbr_list = None
@@ -360,7 +366,7 @@ def full_generic_EnGNN(seed = random.PRNGKey(24),
                  mlp_h = make_mlp(features = [8,8, 8], activation=nn.swish), # mlp for h_i = h_i(h_i, m_i)
                  r_cutoff = r_cutoff,
                  r_switch = None,
-                 neighbor_fn = nbr_fn,
+                 neighbor_fn = nbr_fn.update,
                  box_vectors = box_size
                  )
 
@@ -381,7 +387,7 @@ def full_generic_EnGNN(seed = random.PRNGKey(24),
 def test_full_generic_EnGNN():
     """
     test a full_generic_EnGNN;
-    WARNING : `periodic=True` is discrepant w.r.t. translation operation in ~0.0001. 
+    WARNING : `periodic=True` is discrepant w.r.t. translation operation in ~0.0001.
     """
     #full_generic_EnGNN(periodic=True)
     full_generic_EnGNN(periodic=False)

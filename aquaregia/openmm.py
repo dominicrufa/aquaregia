@@ -246,7 +246,9 @@ def handle_exceptions(openmm_nonbonded_force : openmm.NonbondedForce) -> Tuple[N
                                     reference_position=None,
                                     did_buffer_overflow=False,
                                     max_occupancy=0.,
-                                    cell_list_fn=None)
+                                    cell_list=None,
+                                    format=None,
+                                    update_fn=None)
 
     for key in template_nonbonded_exception_parameters.keys():
         nonbonded_exception_parameters[key] = Array([q + [0.]*(max_exceptions - len(q)) for q in template_nonbonded_exception_parameters[key]])
