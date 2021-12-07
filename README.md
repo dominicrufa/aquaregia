@@ -13,6 +13,14 @@ and an example on how to run a simulation with PBCs is [here](https://gist.githu
 
 The codebase is subject to change.
 
+installation
+------------
+```
+mamba create --name aquaregia -c conda-forge jax-md openmmtools rdkit tqdm matplotlib jupyterlab
+pip install flax
+pip install haiku
+```
+
 --------
 
 <p><small>Project based on the <a target="_blank" href="https://drivendata.github.io/cookiecutter-data-science/">cookiecutter data science project template</a>. #cookiecutterdatascience</small></p>
