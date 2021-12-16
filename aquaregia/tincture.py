@@ -1,4 +1,6 @@
 """constructors of rotational-, translational- and permutational-equivariant RealNVP-based deterministic leapfrog integrators with support for both free and periodic boundary conditions"""
+from jax.config import config
+config.update("jax_enable_x64", True)
 from typing import Sequence, Callable, Dict, Tuple, Optional, Any
 import jax
 import flax.linen as nn
@@ -6,10 +8,6 @@ import jax.numpy as jnp
 from functools import partial
 from jax import lax, ops, vmap, jit, grad, random, value_and_grad
 from jax.experimental import optimizers
-
-from jax.config import config
-
-config.update("jax_enable_x64", True)
 
 import jraph
 from jax.ops import segment_sum
