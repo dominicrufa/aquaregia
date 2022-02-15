@@ -1,7 +1,7 @@
 """utilities"""
-from typing import Sequence, Callable, Dict, Tuple, Optional, NamedTuple
+from typing import Sequence, Callable, Dict, Tuple, Optional, NamedTuple, Union, Any, Mapping, Iterable
 import jax
-import flax.linen as nn
+# import flax.linen as nn
 import jax.numpy as jnp
 from functools import partial
 from jax import lax, ops, vmap, jit, grad, random
@@ -13,8 +13,8 @@ from jax.config import config
 config.update("jax_enable_x64", True)
 
 # Typing
-Array = jnp.array
-from jraph._src.utils import ArrayTree
+Array = jnp.array # get arraytree
+ArrayTree = Union[jnp.ndarray, Iterable['ArrayTree'], Mapping[Any, 'ArrayTree']]
 EnergyFn = Callable[[Array, ...], float]
 
 # E(n)-Equivariant Graph Fns
@@ -135,7 +135,29 @@ def radial_basis(d_ij : float,
     """
     return jnp.exp(-gamma * (d_ij - mu_ks)**2)
 
+def polynomial_switching_fn(r : Array, r_cutoff : float, r_switch : float) -> Array:
+    x = (r - r_switch) / (r_cutoff - r_switch) # compute argument to polynomial
+    mults = jnp.where(jnp.logical_and(r > r_switch, r <= r_cutoff), 1. + (x**3) * (-10. + x * (15. - (6. * x))), 1.)
+    final_mults = jnp.where(r > r_cutoff, 0., mults)
+    return final_mults
 
+def rotation_matrix(axis, theta):
+    import scipy
+    return scipy.linalg.expm(np.cross(np.eye(3), axis * theta))
+
+def random_rotation_matrix(numpy_random_state, epsilon=1e-6):
+    """
+    Generates a random 3D rotation matrix from axis and angle.
+    Args:
+        numpy_random_state: numpy random state object
+    Returns:
+        Random rotation matrix.
+    """
+    rng = numpy_random_state
+    axis = rng.randn(3)
+    axis /= np.linalg.norm(axis) + epsilon
+    theta = 2 * np.pi * rng.uniform(0.0, 1.0)
+    return rotation_matrix(axis, theta)
 
 def compute_atom_centered_fingerprints(mol,
                                        generator,

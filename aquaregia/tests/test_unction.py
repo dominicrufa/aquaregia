@@ -60,13 +60,13 @@ def test_MaskedMLP():
     assert jnp.allclose(jnp.mean(outputs[:4], axis=0), jnp.zeros(2))
     assert jnp.allclose(jnp.var(outputs[:4], axis=0), 1., atol=1e-4)
 
-def render_get_identical_system_GraphsTuple(periodic=True, num_stacks=3, seed = random.PRNGKey(3246)):
+def render_get_identical_system_GraphsTuple(periodic=True, num_stacks=3, seed = random.PRNGKey(3246), particles_per_side=4):
     from aquaregia.tests.test_tincture import get_periodic_particles
     from aquaregia.unction import get_identical_system_GraphsTuple
     seed, run_seed = random.split(seed)
     R, displacement, shift, nbr_fn, hs, edges, box_size = get_periodic_particles(seed = run_seed,
                            periodic = periodic,
-                           particles_per_side = 4,
+                           particles_per_side = particles_per_side,
                            spacing = 0.1,
                            hs_features = 2,
                            r_cutoff = 0.15,
@@ -176,3 +176,87 @@ def test_RNVPVelocityEGCL():
     equivariant
     """
     render_RNVPVelocityEGCL()
+
+def render_RNVP(periodic=False, seed = random.PRNGKey(4572), num_stacks=2, particles_per_side=3, RNVP_repeats=2):
+    from aquaregia.utils import get_vacuum_neighbor_list
+    from aquaregia.unction import get_identical_system_GraphsTuple, RNVP
+    import copy
+    import functools
+
+    def graph_generator_fn(positions, velocities, hs, stacked_neighbor_list_indices, dimension=3):
+        first_two_dims = stacked_neighbor_list_indices.shape[:2]
+        stacked_positions = positions[:-1].reshape((first_two_dims[0],first_two_dims[1],dimension))
+        stacked_velocities = velocities[:-1].reshape((first_two_dims[0],first_two_dims[1],dimension))
+        return get_identical_system_GraphsTuple(positions=stacked_positions,
+                                                stacked_neighbor_list_indices=stacked_neighbor_list_indices,
+                                                hs_features=hs,
+                                                velocities = stacked_velocities)
+    run_seed, seed = random.split(seed)
+    graph, node_mask, edge_mask, displacement, shift, nbr_fn, hs, edges, box_size = render_get_identical_system_GraphsTuple(periodic=periodic,
+                                                                                                                            seed = run_seed,
+                                                                                                                            num_stacks=num_stacks,
+                                                                                                                            particles_per_side=particles_per_side)
+    nbr_list_idx_singleton = get_vacuum_neighbor_list(graph.n_node[0]).idx
+    stacked_nbr_list_idx_triplet = jnp.tile(nbr_list_idx_singleton, (num_stacks,1,1))
+
+    graph_generator_fn = functools.partial(graph_generator_fn, hs = hs, stacked_neighbor_list_indices = stacked_nbr_list_idx_triplet)
+    EGCL_kwargs = {'displacement_fn': displacement,
+               'num_layers': 2,
+               'partialed_message_aggregator': functools.partial(jraph.segment_sum, num_segments=jnp.sum(graph.n_node))
+              }
+
+    segment_ids = jnp.concatenate([Array([i]*num_nodes) for i, num_nodes in enumerate(graph.n_node)])
+    partialed_segment_sum = functools.partial(jraph.segment_sum, segment_ids = segment_ids, num_segments = len(graph.n_node))
+
+    RNVP_FORWARD_KWARGS = {'name': 'RNVPForward',
+                       'shift_fn': shift,
+                       'num_repeats': RNVP_repeats,
+                       'graph_regenerator_fn': graph_generator_fn,
+                       'PositionUpdate_kwarg_dict': {},
+                       'VelocityUpdate_kwarg_dict': {'RNVPVelocityEGCL_kwarg_dict': {'EGCL_kwarg_dict': EGCL_kwargs},
+                                                     'partialed_segment_sum': partialed_segment_sum,
+                                                     'velocity_scale': 1.},
+                       'forward': True
+                      }
+
+    RNVP_BACKWARD_KWARGS = copy.deepcopy(RNVP_FORWARD_KWARGS)
+    RNVP_BACKWARD_KWARGS['forward'] = False
+
+    def _forward_run(graph, node_mask, edge_mask, is_training):
+        module = RNVP(**RNVP_FORWARD_KWARGS)(graph, node_mask, edge_mask, is_training)
+        return module
+
+    def _backward_run(graph, node_mask, edge_mask, is_training):
+        module = RNVP(**RNVP_BACKWARD_KWARGS)(graph, node_mask, edge_mask, is_training)
+        return module
+
+    forward_run = hk.without_apply_rng(hk.transform_with_state(_forward_run))
+    backward_run = hk.without_apply_rng(hk.transform_with_state(_backward_run))
+
+    run_seed, seed = random.split(seed)
+    params, state = forward_run.init(run_seed, graph, node_mask, edge_mask, is_training=True)
+    _, _ = backward_run.init(run_seed, graph, node_mask, edge_mask, is_training=True)
+
+    (forward_graph, forward_logdetJ), forward_state = forward_run.apply(params, state, graph, node_mask, edge_mask, is_training=False)
+    (backward_graph, backward_logdetJ), _ = backward_run.apply(params, state, forward_graph, node_mask, edge_mask, is_training=False)
+
+    # assert logdetJ is consistent and positions/velocities are invertible
+    assert jnp.allclose(forward_logdetJ, backward_logdetJ)
+    assert jnp.allclose(graph.nodes['xs'], backward_graph.nodes['xs'])
+    assert jnp.allclose(graph.nodes['vs'], backward_graph.nodes['vs'])
+
+    # equivariance about rotations/translations
+    run_seed, seed = random.split(seed)
+    mod_graph, translation_vec, rotation_matrix = make_vac_rot_translated_graph(run_seed, graph)
+
+    (forward_mod_graph, forward_mod_logdetJ), _ = forward_run.apply(params, state, mod_graph, node_mask, edge_mask, is_training=False)
+
+    assert jnp.allclose(forward_mod_logdetJ, forward_logdetJ)
+    assert jnp.allclose((forward_graph.nodes['xs'][:-1] @ rotation_matrix + translation_vec), forward_mod_graph.nodes['xs'][:-1])
+    assert jnp.allclose((forward_graph.nodes['vs'][:-1] @ rotation_matrix), forward_mod_graph.nodes['vs'][:-1])
+
+
+
+def test_render_RNVP():
+    """test the RNVP, including invertibility and equivariance about rotation/translation in vacuum"""
+    render_RNVP()
