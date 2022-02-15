@@ -93,10 +93,11 @@ def make_scalar_mlp(num, kernel_init) -> MLPFn:
 # this should be a util...
 def polynomial_switching_fn(r : Array, r_cutoff : float, r_switch : float) -> float:
     x = (r - r_switch) / (r_cutoff - r_switch)
-    return lax.cond(r < r_switch,
+    switched_x = lax.cond(r < r_switch,
                    lambda _x: 1.,
                    lambda _x: 1. + (_x**3) * (-10. + _x * (15. - (6. * _x))),
                    x)
+    return lax.cond(r < r_cutoff, lambda _x: switched_x, lambda _x: 0., switched_x)
 
 def get_stacked_mat_from_vector(vec : Array)-> Array:
     """

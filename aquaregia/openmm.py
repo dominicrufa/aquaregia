@@ -12,8 +12,7 @@ import tqdm
 from jax.config import config
 config.update("jax_enable_x64", True)
 
-import jraph
-from jraph._src.models import ArrayTree
+from aquaregia.utils import Array, ArrayTree
 from jax_md import space
 from jax_md.partition import NeighborList, NeighborFn
 from jax_md.util import high_precision_sum, maybe_downcast
