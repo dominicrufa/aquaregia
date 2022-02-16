@@ -37,7 +37,7 @@ def get_vacuum_neighbor_list(num_particles : int) -> NeighborList:
                                         max_occupancy=0.,
                                         format = NeighborListFormat.Dense,
                                         update_fn = None,
-                                        cell_list=None) #why we need this arg?
+                                        cell_list_capacity=None) #why we need this arg?
     return vacuum_neighbor_list
 
 

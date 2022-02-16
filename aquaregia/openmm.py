@@ -245,7 +245,7 @@ def handle_exceptions(openmm_nonbonded_force : openmm.NonbondedForce) -> Tuple[N
                                     reference_position=None,
                                     did_buffer_overflow=False,
                                     max_occupancy=0.,
-                                    cell_list=None,
+                                    cell_list_capacity=None,
                                     format=None,
                                     update_fn=None)
 
