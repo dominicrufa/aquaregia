@@ -141,6 +141,21 @@ def polynomial_switching_fn(r : Array, r_cutoff : float, r_switch : float) -> Ar
     final_mults = jnp.where(r > r_cutoff, 0., mults)
     return final_mults
 
+def get_periodic_distance_calculator(metric,
+                                     r_cutoff):
+    d = vmap(vmap(metric, (None, 0)))
+    def distances(xs, neighbor_list):
+        mask = neighbor_list.idx != xs.shape[0]
+        xs_neigh = xs[neighbor_list.idx]
+        dr = d(xs, xs_neigh)
+        return jnp.where(mask, dr, r_cutoff)
+    return distances
+
+def get_mask(neighbor_list):
+    num_particles, max_neighbors = neighbor_list.idx.shape
+    mask = neighbor_list.idx != num_particles
+    return mask
+
 def rotation_matrix(axis, theta):
     import scipy
     return scipy.linalg.expm(np.cross(np.eye(3), axis * theta))

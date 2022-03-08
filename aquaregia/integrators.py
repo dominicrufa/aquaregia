@@ -37,91 +37,6 @@ def metropolize_bool(reduced_work : float, # unitless
     accept = (lu <= log_acceptance_prob)
     return accept
 
-def V_update(xs : Array,
-             vs : Array,
-             neighbor_list : NeighborList,
-             potential_energy_fn : EnergyFn,
-             potential_energy_params : ArrayTree,
-             dt : float,
-             mass : Array) -> Array:
-    out_vs = vs + -grad(potential_energy_fn)(xs, neighbor_list, potential_energy_params) * dt / mass[..., jnp.newaxis]
-    return out_vs
-
-def R_update(xs : Array,
-             vs : Array,
-             dt : float,
-             shift_fn : jax_md.space.ShiftFn) -> Array:
-
-    return vmap(shift_fn, in_axes=(0,0))(xs, vs * dt)
-
-def O_update(vs : Array,
-             noise_seed : Seed,
-             mass : Array,
-             a : float,
-             b : float,
-             kT : float) -> Array:
-    n, d = vs.shape
-    return a * vs + b * jnp.sqrt(kT / mass[..., jnp.newaxis]) * random.normal(noise_seed, shape=(n,d))
-
-# def make_static_BAOAB_kernel(potential_energy_fn : EnergyFn,
-#                              neighbor_fn : NeighborFn,
-#                              dt : float,
-#                              gamma : float,
-#                              mass : Array,
-#                              shift_fn : jax_md.space.ShiftFn,
-#                              kinetic_energy_fn : Optional[EnergyFn] = kinetic_energy,
-#                              get_shadow_work : Optional[Union[bool, str]] = False,
-#                              ) -> Callable[Tuple[Array, Array, Array, ArrayTree, float], Tuple[Array, Array, float]]:
-#     """
-#     function that returns a static BAOAB kernel
-#     TODO : support neighbor lists.
-#     """
-#     a, b = jnp.exp(-gamma * dt), jnp.sqrt(1. - jnp.exp(-2. * gamma * dt)) # get the a and b parameters
-#
-#     #partial kernel fns
-#     partial_V_update = partial(V_update,
-#                                potential_energy_fn=potential_energy_fn,
-#                                dt = dt/2.,
-#                                mass = mass)
-#     partial_R_update = partial(R_update, dt = dt/2., shift_fn=shift_fn)
-#     partial_O_update = partial(O_update, mass = mass, a = a, b = b)
-#     partial_ke = partial(kinetic_energy_fn, mass = mass)
-#
-#     if get_shadow_work is True:
-#         ke_fn = partial_ke
-#         pe_fn = potential_energy_fn
-#     elif get_shadow_work is False:
-#         ke_fn = lambda x: 0.
-#         pe_fn = lambda x, y, z: 0. # this now generically takes 3 args
-#     elif get_shadow_work == 'heat': # return the kinetic energy work of the step
-#         ke_fn = partial_ke
-#         pe_fn = lambda x, y, z: 0.
-#     else:
-#         raise ValueError(f"the argument {get_shadow_work} is not supported")
-#
-#     def run(xs : Array,
-#             vs : Array,
-#             seed : Array,
-#             neighbor_list : NeighborList,
-#             potential_energy_params : ArrayTree,
-#             kT : float) -> Tuple[Array, Array, float]:
-#         """returns new xs, vs, and the (unit'd) shadow work if specified; otherwise is zero"""
-#         neighbor_list = neighbor_fn(xs, neighbor_list)
-#         e0 = ke_fn(vs) + pe_fn(xs, neighbor_list, potential_energy_params)
-#         vs1 = partial_V_update(xs, vs, neighbor_list = neighbor_list, potential_energy_params=potential_energy_params) #V
-#         xs1 = partial_R_update(xs, vs1) #R
-#         neighbor_list = neighbor_fn(xs1, neighbor_list)
-#         ke0 = ke_fn(vs1)
-#         vs2 = partial_O_update(vs = vs1, noise_seed=seed, kT=kT) #O
-#         ke1 = ke_fn(vs2)
-#         xs2 = partial_R_update(xs1, vs2) #R
-#         neighbor_list = neighbor_fn(xs2, neighbor_list)
-#         vs3 = partial_V_update(xs2, vs2, neighbor_list = neighbor_list, potential_energy_params = potential_energy_params) #V
-#         e1 = ke_fn(vs3) + pe_fn(xs2, neighbor_list, potential_energy_params)
-#
-#         return xs2, vs3, e1 - e0 - (ke1 - ke0)
-#
-#     return run
 
 def BAOAB_coeffs(kT, dt, gamma, masses):
     scale = jnp.sqrt(kT / masses[..., jnp.newaxis])
@@ -149,66 +64,6 @@ def make_static_BAOAB_kernel(potential_energy_fn : EnergyFn,
         return new_x, new_v
     return run
 
-def make_folded_integrator(integrator,
-                           neighbor_fns,
-                           mod_potential_params_fn,
-                           mod_kT_fn,
-                           potential_energy_fn
-                          ):
-    """make a folded integrator; do not jit this"""
-
-    def scan_int(carry, x):
-        """carry is xs, vs, start_pe, seed"""
-        in_xs, in_vs, neighbor_list, in_seed = carry #open the carry
-        out_seed, run_seed = random.split(in_seed) # split the in_seed
-
-        kT = mod_kT_fn(x) #get kT
-        potential_energy_params = mod_potential_params_fn(x) # get potential energy params
-
-        neighbor_list = neighbor_fns.update(in_xs, neighbor_list)
-        out_xs, out_vs = integrator(xs = in_xs,
-                                    vs = in_vs,
-                                    seed = run_seed,
-                                    neighbor_list = neighbor_list,
-                                    potential_energy_params = potential_energy_params,
-                                    kT = kT) # run the integrator
-
-        return (out_xs, out_vs, neighbor_list, out_seed), None
-
-    @jit
-    def folded_integrator(xs, vs, neighbor_list, seed, sequence):
-        in_carry = (xs, vs, neighbor_list, seed) #no need to jit
-        out_carry, _ = jax.lax.scan(scan_int, in_carry, sequence)
-        out_xs, out_vs, neighbor_list, seed = out_carry #no need to jit
-        return out_xs, out_vs, neighbor_list
-    return folded_integrator
-
-def get_folded_equilibrium_integrator(potential_energy_fn : EnergyFn,
-                                      neighbor_fns : NeighborFn,
-                                      potential_energy_parameters : ArrayTree,
-                                      kT : float,
-                                      dt : float,
-                                      gamma : float,
-                                      mass : Array,
-                                      shift_fn : jax_md.space.ShiftFn):
-    """make an equilibrium simulator"""
-    base_integrator = make_static_BAOAB_kernel(potential_energy_fn = potential_energy_fn,
-                                               dt = dt,
-                                               gamma = gamma,
-                                               mass = mass,
-                                               shift_fn = shift_fn)
-
-    def mod_potential_params_fn(*args): return potential_energy_parameters
-    def mod_kT_fn(*args): return kT
-    def dummy_potential_energy_fn(*args): return 0.
-
-    folded_integrator = make_folded_integrator(integrator = base_integrator,
-                                               neighbor_fns = neighbor_fns,
-                                               mod_potential_params_fn = mod_potential_params_fn,
-                                               mod_kT_fn = mod_kT_fn,
-                                               potential_energy_fn = dummy_potential_energy_fn)
-    return folded_integrator
-
 # utility to thermalize velocities
 def thermalize(seed, masses, kT, dimension):
     """the mean is 0 and the standard deviation is sqrt(kT/m) for each particle."""
@@ -216,30 +71,86 @@ def thermalize(seed, masses, kT, dimension):
     out = random.normal(seed, shape=(len(masses), dimension)) * std_devs[..., jnp.newaxis]
     return out
 
-def get_nonequilibrium_integrator(potential_energy_fn : EnergyFn,
-                                  potential_energy_parameters : ArrayTree,
-                                  kT : float,
-                                  dt : float,
-                                  gamma : float,
-                                  mass : Array,
-                                  mod_potential_params_fn : Callable[[float], ArrayTree], # potential energy protocol,
-                                  mod_kT_fn : Callable[[float], float], # kT protocol (effective temperature)
-                                  shift_fn : jax_md.space.ShiftFn,
-                                  kinetic_energy_fn : Optional[EnergyFn] = kinetic_energy,
-                                  get_shadow_work : Optional[bool] = False):
-    """make an equilibrium simulator"""
-    base_integrator = make_static_BAOAB_kernel(potential_energy_fn = potential_energy_fn,
-                             dt = dt,
-                             gamma = gamma,
-                             mass = mass,
-                             shift_fn = shift_fn,
-                             kinetic_energy_fn = kinetic_energy_fn,
-                             get_shadow_work = get_shadow_work,
-                             )
+class BaseIntegratorGenerator(object):
+    """
+    create an integrator
+    """
+    def __init__(self,
+                 canonical_u_fn : Callable,
+                 neighbor_list : NeighborList,
+                 dt : float,
+                 masses : Array,
+                 kT : float,
+                 shift_fn : Callable,
+                 neighbor_list_update_fn : Optional[Callable] = None,
+                 ):
+        from aquaregia.integrators import thermalize
+        self._canonical_u_fn = canonical_u_fn
+        self._neighbor_list_template = neighbor_list
+        self._shift_fn = shift_fn
+        self._thermalizer = partial(thermalize, masses = masses, kT = kT, dimension = 3)
 
+        if neighbor_list_update_fn is None:
+            self._neighbor_list_update_fn = lambda x,y : self._neighbor_list_template
+        else:
+            self._neighbor_list_update_fn = neighbor_list_update_fn
 
-    folded_integrator = make_folded_integrator(integrator = base_integrator,
-                                               mod_potential_params_fn=mod_potential_params_fn,
-                                               mod_kT_fn=mod_kT_fn,
-                                               potential_energy_fn=potential_energy_fn)
-    return folded_integrator
+        self._dt = dt
+        self._kT = kT
+        self._masses = masses
+
+    def integrator(self, *args, **kwargs) -> Callable:
+        """
+        get a jittable integrator fn
+        """
+        raise NotImplementedError()
+
+class BAOABIntegratorGenerator(BaseIntegratorGenerator):
+    """
+    generate a BAOAB integrator
+    """
+    def __init__(self,
+                 canonical_u_fn : Callable,
+                 neighbor_list : NeighborList,
+                 dt : float,
+                 masses : Array,
+                 kT : float,
+                 shift_fn : Callable,
+                 collision_rate : float,
+                 neighbor_list_update_fn : Optional[Callable] = None,
+                 ):
+        super().__init__(canonical_u_fn, neighbor_list, dt, masses, kT, shift_fn, neighbor_list_update_fn)
+        self._collision_rate = collision_rate
+
+    def integrator(self,
+                   num_steps : int,
+                   remove_neighbor_list : Optional[bool] = False,
+                   **kwargs):
+        from aquaregia.integrators import BAOAB_coeffs, make_static_BAOAB_kernel
+
+        # single_step_integrator : Callable[[xs, vs, seed, neighbor_list, u_params, kT], [xs, vs]]
+        single_step_integrator = make_static_BAOAB_kernel(potential_energy_fn=self._canonical_u_fn,
+                                                          dt = self._dt,
+                                                          gamma = self._collision_rate,
+                                                          mass = self._masses,
+                                                          shift_fn = self._shift_fn)
+        
+        def scanner(carry, x):
+            """carry xs, vs, neighbor_list, u_params, seed"""
+            in_xs, in_vs, neighbor_list, u_params, seed = carry
+            out_seed, run_seed = jax.random.split(seed)
+            neighbor_list = self._neighbor_list_update_fn(in_xs, neighbor_list)
+            out_xs, out_vs = single_step_integrator(in_xs, in_vs, run_seed, neighbor_list, u_params, kT=self._kT)
+            return (out_xs, out_vs, neighbor_list, out_seed), None
+
+        def folded_integrator(xs, u_params, seed, neighbor_list, sequence):
+            therm_seed, seed = jax.random.split(seed)
+            in_carry = (xs, self._thermalizer(therm_seed), neighbor_list, u_params, seed)
+            (out_xs, out_vs, neighbor_list, out_seed), _ = scanner(in_carry, sequence)
+            return {'xs' : out_xs, 'vs' : out_vs, 'neighbor_list': neighbor_list} # we can add to this...
+
+        if remove_neighbor_list:
+            out = partial(folded_integrator, neighbor_list = self._neighbor_list_template, sequence = jnp.arange(num_steps))
+        else:
+            out = partial(folded_integrator, sequence = jnp.arange(num_steps))
+        return out

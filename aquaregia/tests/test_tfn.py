@@ -83,7 +83,7 @@ def test_SE3_equivariance(
 
         # convolution
         convolution_module = tfn.Convolution(filter_mlp_dicts = {0: {'output_sizes': [8,8], 'activation': jax.nn.swish}, 1:{'output_sizes': [8,8], 'activation': jax.nn.swish}})
-        convolution_dict = convolution_module(in_tensor_dict = input_dict, rbf_inputs = rbfs, unit_vectors = unit_r_ij)
+        convolution_dict = convolution_module(in_tensor_dict = input_dict, rbf_inputs = rbfs, unit_vectors = unit_r_ij, r_ij = norms)
 
         # TensorNetworkMLP
         output_sizes = {0: [8,1], 1: [8,4]}
