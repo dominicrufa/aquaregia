@@ -28,15 +28,6 @@ def kinetic_energy(vs, mass):
         return 0.5 * _v.dot(_v) / _mass
     return vmap(ke, in_axes=(0,0))(vs, mass).sum()
 
-def metropolize_bool(reduced_work : float, # unitless
-                     seed: Array # random seed
-                     ) -> bool:
-    """from a (unitless) work value and a seed, return accept/reject"""
-    log_acceptance_prob = jnp.min(Array([0., -reduced_work]))
-    lu = jnp.log(random.uniform(seed))
-    accept = (lu <= log_acceptance_prob)
-    return accept
-
 
 def BAOAB_coeffs(kT, dt, gamma, masses):
     scale = jnp.sqrt(kT / masses[..., jnp.newaxis])
@@ -134,19 +125,19 @@ class BAOABIntegratorGenerator(BaseIntegratorGenerator):
                                                           gamma = self._collision_rate,
                                                           mass = self._masses,
                                                           shift_fn = self._shift_fn)
-        
+
         def scanner(carry, x):
             """carry xs, vs, neighbor_list, u_params, seed"""
             in_xs, in_vs, neighbor_list, u_params, seed = carry
             out_seed, run_seed = jax.random.split(seed)
             neighbor_list = self._neighbor_list_update_fn(in_xs, neighbor_list)
             out_xs, out_vs = single_step_integrator(in_xs, in_vs, run_seed, neighbor_list, u_params, kT=self._kT)
-            return (out_xs, out_vs, neighbor_list, out_seed), None
+            return (out_xs, out_vs, neighbor_list, u_params, out_seed), None
 
         def folded_integrator(xs, u_params, seed, neighbor_list, sequence):
             therm_seed, seed = jax.random.split(seed)
             in_carry = (xs, self._thermalizer(therm_seed), neighbor_list, u_params, seed)
-            (out_xs, out_vs, neighbor_list, out_seed), _ = scanner(in_carry, sequence)
+            (out_xs, out_vs, neighbor_list, u_params, out_seed), _ = jax.lax.scan(scanner, in_carry, sequence)
             return {'xs' : out_xs, 'vs' : out_vs, 'neighbor_list': neighbor_list} # we can add to this...
 
         if remove_neighbor_list:

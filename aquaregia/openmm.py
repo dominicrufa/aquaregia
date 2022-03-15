@@ -95,6 +95,14 @@ class ValenceForceConverter(BaseForceConverter):
         self._vdisplacement_fn = vmap(displacement_fn, in_axes = (0,0))
         super().__init__(omm_force = omm_force, displacement_fn = displacement_fn, particle_indices = particle_indices)
 
+def com_harmonic_restraint_force(R, parameter_dict, metric_fn, **kwargs):
+    R_g0 = R[parameter_dict['g0_indices'],:]
+    R_g1 = R[parameter_dict['g1_indices'],:]
+    g0_COM = jnp.sum(R_g0 * parameter_dict['g0_masses'][..., jnp.newaxis], axis=0) / parameter_dict['g0_masses'].sum()
+    g1_COM = jnp.sum(R_g1 * parameter_dict['g1_masses'][..., jnp.newaxis], axis=0) / parameter_dict['g1_masses'].sum()
+    dr = metric_fn(g0_COM, g1_COM)
+    return 0.5 * parameter_dict['K'] * jnp.power(dr, 2) * parameter_dict['lambda_restraints']
+
 class HarmonicCOMRestraintForce(ValenceForceConverter):
     """convert a `CustomCentroidBondForce` that is shaped like a COM restraining Force"""
     def __init__(self,
@@ -141,14 +149,8 @@ class HarmonicCOMRestraintForce(ValenceForceConverter):
         return parameter_dict
 
     def _make_jax_force_fn(self):
-        def _fn(R, parameter_dict, **kwargs):
-            R_g0 = R[parameter_dict['g0_indices'],:]
-            R_g1 = R[parameter_dict['g1_indices'],:]
-            g0_COM = jnp.sum(R_g0 * parameter_dict['g0_masses'][..., jnp.newaxis], axis=0) / parameter_dict['g0_masses'].sum()
-            g1_COM = jnp.sum(R_g1 * parameter_dict['g1_masses'][..., jnp.newaxis], axis=0) / parameter_dict['g1_masses'].sum()
-            dr = self._base_metric_fn(g0_COM, g1_COM)
-            return 0.5 * parameter_dict['K'] * jnp.power(dr, 2) * parameter_dict['lambda_restraints']
-        return _fn
+        jax_force = partial(com_harmonic_restraint_force, metric_fn = self._base_metric_fn)
+        return jax_force
 
 class HarmonicBondForceConverter(ValenceForceConverter):
     """convert a `HarmonicBondForce`"""
@@ -518,7 +520,9 @@ def make_canonical_energy_fn(system : openmm.System,
                              nonbonded_kwargs_dict : Optional[dict] = {'vacuum_r_cutoff' : DEFAULT_VACUUM_R_CUTOFF,
                                                                        'vacuum_r_switch' : DEFAULT_VACUUM_R_SWITCH},
                              particle_indices : Optional[Sequence] = [],
-                             allow_constraints : Optional[bool] = False)-> Tuple[ArrayTree, EnergyFn]:
+                             allow_constraints : Optional[bool] = False,
+                             auxiliary_force_fn_dict : Optional[dict] = {},
+                             auxiliary_force_parameter_dict : Optional[dict] = {})-> Tuple[ArrayTree, EnergyFn]:
     """write a canonical energy function containing HarmonicBonds, HarmonicAngles, PeriodicTorsions and a NonbondedForce"""
     forces = system.getForces()
     force_dict = {force.__class__.__name__ : force for force in forces}
@@ -560,14 +564,22 @@ def make_canonical_energy_fn(system : openmm.System,
         out_params[force_name] = parameter_dict
         del force_converter
 
+    # update the out_fns with auxiliary_force_dict
+    if len(auxiliary_force_fn_dict) != 0:
+        assert set(auxiliary_force_fn_dict.keys()) == set(auxiliary_force_parameter_dict.keys())
+        for aux_force_name in auxiliary_force_fn_dict.keys():
+            assert aux_force_name in KNOWN_FORCE_fns, f"aux force name {aux_force_name} is not known"
+            assert aux_force_name not in out_fns.keys(), f"aux force name {aux_force_name} is already handled."
+        out_fns.update(auxiliary_force_fn_dict)
+        out_params.update(auxiliary_force_parameter_dict)
 
-        def out_energy_fn(xs : Array, neighbor_list : NeighborList, parameters : ArrayTree):
-            running_sum = 0.
-            for key in parameters.keys():
-                running_sum = running_sum + out_fns[key](R = xs,
-                                                         neighbor_list = neighbor_list,
-                                                         parameter_dict = parameters[key])
-            return running_sum
+    def out_energy_fn(xs : Array, neighbor_list : NeighborList, parameters : ArrayTree):
+        running_sum = 0.
+        for key in parameters.keys():
+            running_sum = running_sum + out_fns[key](R = xs,
+                                                     neighbor_list = neighbor_list,
+                                                     parameter_dict = parameters[key])
+        return running_sum
 
     return out_params, out_energy_fn
 
