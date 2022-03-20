@@ -6,7 +6,7 @@ from functools import partial
 from jax.config import config
 config.update("jax_enable_x64", True)
 from aquaregia.utils import Array, ArrayTree
-FREE_ENERGY_TOLERANCE = 1e-2
+FREE_ENERGY_TOLERANCE = 5e-2
 
 def test_AbsoluteFECProtocol():
     """
@@ -95,7 +95,7 @@ def test_NonCanonicalUniformLogPReplicaExchangeSampler():
 
     # make two propagators. the first one exists to run an equilibration before repex
     prelim_propagator = int_generator.integrator(num_steps=5000, remove_neighbor_list=True)
-    repex_propagator = int_generator.integrator(num_steps=500, remove_neighbor_list=True)
+    repex_propagator = int_generator.integrator(num_steps=100, remove_neighbor_list=True)
 
     num_windows=100 # define the number of windows
 
@@ -124,7 +124,7 @@ def test_NonCanonicalUniformLogPReplicaExchangeSampler():
 
     # execute the repex sampler
     seed = jax.random.PRNGKey(231)
-    out_dict = repex_sampler.execute(out_batch_xs, seed, num_iterations=100, num_swaps_per_mix_iteration=10000)
+    out_dict = repex_sampler.execute(out_batch_xs, seed, num_iterations=50, num_swaps_per_mix_iteration=10000)
 
     # analyze the repex sampler
     mbar, total_accept_rate, acc_mat = repex_sampler.analyze()

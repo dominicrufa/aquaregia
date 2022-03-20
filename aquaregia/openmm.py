@@ -6,6 +6,7 @@ from functools import partial
 from jax import lax, ops, vmap, jit, grad, random
 from jax.scipy.special import erfc
 from aquaregia.utils import polynomial_switching_fn, get_periodic_distance_calculator, get_mask
+import warnings
 import tqdm
 
 
@@ -26,7 +27,13 @@ from simtk import openmm, unit
 from aquaregia.utils import EnergyFn, Array
 from aquaregia.tfn import DEFAULT_EPSILON
 Quantity = unit.quantity.Quantity
-KNOWN_FORCE_fns = ['HarmonicBondForce', 'HarmonicAngleForce', 'PeriodicTorsionForce', 'NonbondedForce', 'CustomCentroidBondForce']
+KNOWN_FORCE_fns = ['HarmonicBondForce',
+                   'HarmonicAngleForce',
+                   'PeriodicTorsionForce',
+                   'NonbondedForce',
+                   'CustomCentroidBondForce',
+                   'MonteCarloBarostat'
+                   'NNPForce']
 DEFAULT_VACUUM_R_CUTOFF = 10.
 DEFAULT_VACUUM_R_SWITCH = 9.
 
@@ -328,6 +335,7 @@ class NonbondedForceConverter(ValenceForceConverter):
                  particle_indices : Sequence,
                  vacuum_r_cutoff : Optional[float] = 10.,
                  vacuum_r_switch : Optional[float] = 9.,
+                 allow_periodic_to_vacuum : Optional[bool] = True,
                  **kwargs
                  ):
         if omm_force.__class__.__name__ != 'NonbondedForce': raise ValueError("{omm_force.__class__.__name__} is not a `NonbondedForce`")
@@ -349,7 +357,7 @@ class NonbondedForceConverter(ValenceForceConverter):
         self._r_switch = self._omm_force.getSwitchingDistance().value_in_unit_system(unit.md_unit_system) if self._periodic else vacuum_r_switch
         self._delta = self._omm_force.getEwaldErrorTolerance()
 
-        if self._periodic:
+        if self._periodic and not allow_periodic_to_vacuum:
             raise NotImplementedError(f"periodic needs yet another test. currently not implemented")
         else:
             self._electrostatic_fn = partial(lifted_vacuum_electrostatics, r_cutoff = self._r_cutoff, r_switch = self._r_switch)
@@ -522,7 +530,8 @@ def make_canonical_energy_fn(system : openmm.System,
                              particle_indices : Optional[Sequence] = [],
                              allow_constraints : Optional[bool] = False,
                              auxiliary_force_fn_dict : Optional[dict] = {},
-                             auxiliary_force_parameter_dict : Optional[dict] = {})-> Tuple[ArrayTree, EnergyFn]:
+                             auxiliary_force_parameter_dict : Optional[dict] = {},
+                             omit_unhandled_forces : Optional[bool] = True)-> Tuple[ArrayTree, EnergyFn]:
     """write a canonical energy function containing HarmonicBonds, HarmonicAngles, PeriodicTorsions and a NonbondedForce"""
     forces = system.getForces()
     force_dict = {force.__class__.__name__ : force for force in forces}
@@ -556,7 +565,11 @@ def make_canonical_energy_fn(system : openmm.System,
                                                         particle_indices = particle_indices,
                                                         particle_masses = particle_masses)
         else:
-            raise NotImplementedError(f"{force_name} is not an implemented force object")
+            if omit_unhandled_forces:
+                warnings.warn(f"force {force_name} is not currently handled. Omitting")
+                continue
+            else:
+                raise NotImplementedError(f"{force_name} is not an implemented force object")
 
         # now pull the parameters and the functions.
         parameter_dict, energy_fn = force_converter.parameters_and_fn
