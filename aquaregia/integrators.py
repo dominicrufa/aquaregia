@@ -3,7 +3,6 @@
 from typing import Sequence, Callable, Dict, Tuple, Optional, Union, Any, NamedTuple
 from jraph._src.utils import ArrayTree
 import jax
-import flax.linen as nn
 import jax.numpy as jnp
 from functools import partial
 from jax import grad, vmap, jit, random
