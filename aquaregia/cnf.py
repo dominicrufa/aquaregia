@@ -622,83 +622,96 @@ class KinematicCNFFactory(CNFFactory):
         out_dict['pretrain_fn'] = pretrain_fn
         return out_dict
 
-"""
-vector module utils for CNF
-"""
-class VectorModule(hk.Module):
-    """
-    a vector module for SE(3) equivariance
-    """
-    def __init__(self,
-                 num_particles : int,
-                 input_L0_channel_dimension : tuple,
-                 conv_dict_list : Iterable,
-                 mlp_dict_list : Iterable,
-                 SinusoidalBasis_kwargs : dict,
-                 time_convolution_kwargs : dict,
-                 name : Optional[str] = f"vector"):
-        super().__init__(name=name)
-        self.SinusoidalBasis_module = tfn.SinusoidalBasis(**SinusoidalBasis_kwargs)
-        self._num_particles = num_particles
-        self._input_L0_channel_dimension = input_L0_channel_dimension
-
-        # time convolution
-        self.time_convolution_module = hk.nets.MLP(**time_convolution_kwargs)
-
-        # setup the for loop
-        layers = {}
-        num_layers = len(conv_dict_list)
-        for layer in range(num_layers):
-            conv_module = tfn.Convolution(**conv_dict_list[layer])
-            tfn_module_dict = {_L: tfn.TensorFieldMLP(**mlp_dict_list[layer][_L]) for _L in mlp_dict_list[layer].keys()}
-            layers[layer] = {'conv': conv_module, 'mlp': tfn_module_dict}
-        self.layers = layers
-
-    def __call__(self,
-                 t : float,
-                 xs_and_vs : Array,
-                 feature_dictionary : ArrayTree,
-                 epsilon : Optional[float] = tfn.DEFAULT_EPSILON,
-                 mask_value : Optional[float] = 0.,
-                 ):
-        positions, velocities = xs_and_vs[0], xs_and_vs[1]
-
-        #simple check on feature dictionary
-        if feature_dictionary[0].shape != (self._num_particles, self._input_L0_channel_dimension, 1):
-            raise ValueError(f"""the feature dictionary's L=0 input ({feature_dictionary[0].shape})
-                                 is not equal to the specified channel dimension
-                                 ({(self._num_particles, self._input_L0_channel_dimension, 1)})""")
-        elif feature_dictionary[1] is not None:
-            raise ValueError(f"the input feature dictionary should have no annotations on the L=1 input")
-
-        r_ij = tfn.DEFAULT_VDISPLACEMENT_FN(positions, positions)
-        unit_r_ij, norms = tfn.unit_vectors_and_norms(r_ij) # compute unit vectors and norms
-        norms = tfn.mask_tensor(norms, mask_val = mask_value)
-        norms = jnp.squeeze(norms)
-
-        rbf_inputs = self.SinusoidalBasis_module(r_ij = norms, epsilon=epsilon, mask_val=mask_value)
-
-        # concat feature dictionary with time convolutions.
-        time_convolution = self.time_convolution_module(Array([t]))
-        repeated_time_convolution = jnp.repeat(time_convolution[jnp.newaxis, ..., jnp.newaxis], repeats=self._num_particles, axis=0)
-        aug_L0 = jnp.hstack([feature_dict[0], repeated_time_convolution])
-        in_tensor_dict = {L : _tensor for L, _tensor in feature_dictionary.items()}
-        in_tensor_dict[0] = aug_L0
-
-        for layer_idx in range(len(self.layers)):
-            out_tensor_dict = {}
-            layer_dict = self.layers[layer_idx]
-            conv_dict = layer_dict['conv'](in_tensor_dict=in_tensor_dict, rbf_inputs=rbf_inputs, unit_vectors=unit_r_ij, r_ij = norms, epsilon = tfn.DEFAULT_EPSILON)
-            for _L in conv_dict.keys(): #iterate over the mlps/angular numbers
-                mlp = layer_dict['mlp'][_L]
-                p_array = mlp(inputs=conv_dict[_L], epsilon=epsilon) # pass convolved arrays through mlp
-                out_tensor_dict[_L] = p_array # populate out dict
-            in_tensor_dict = out_tensor_dict
-
-        # extract and update
-        scales = in_tensor_dict[1][:,0,:]
-        translations = in_tensor_dict[1][:,1,:]
-        return jnp.array([velocities, scales * velocities + translations]), scales, translations
+# """
+# vector module utils for CNF
+# """
+# class VectorModule(hk.Module):
+#     """
+#     a vector module for SE(3) equivariance
+#     """
+#     def __init__(self,
+#                  num_particles : int,
+#                  input_L0_channel_dimension : tuple,
+#                  conv_dict_list : Iterable,
+#                  mlp_dict_list : Iterable,
+#                  SinusoidalBasis_kwargs : dict,
+#                  time_convolution_kwargs : dict,
+#                  name : Optional[str] = f"vector"):
+#         super().__init__(name=name)
+#         self.SinusoidalBasis_module = tfn.SinusoidalBasis(**SinusoidalBasis_kwargs)
+#         self._num_particles = num_particles
+#         self._input_L0_channel_dimension = input_L0_channel_dimension
+#
+#         # time convolution
+#         self.time_convolution_module = hk.nets.MLP(**time_convolution_kwargs)
+#
+#         # setup the for loop
+#         layers = {}
+#         num_layers = len(conv_dict_list)
+#         for layer in range(num_layers):
+#             conv_module = tfn.Convolution(**conv_dict_list[layer])
+#             tfn_module_dict = {_L: tfn.TensorFieldMLP(**mlp_dict_list[layer][_L]) for _L in mlp_dict_list[layer].keys()}
+#             layers[layer] = {'conv': conv_module, 'mlp': tfn_module_dict}
+#         self.layers = layers
+#
+#         # make vmap and fori functions
+#         def fori_body_fn(layer_idx, val_tuple):
+#             layer_dict = self.layers[layer_idx]
+#             in_tensor_dict, rbf_inputs, unit_r_ij, norms, epsilon = val_tuple
+#             conv_dict = layer_dict['conv'](in_tensor_dict=in_tensor_dict, rbf_inputs=rbf_inputs, unit_vectors=unit_r_ij, r_ij = norms, epsilon = tfn.DEFAULT_EPSILON)
+#             reference_dict = {_L : _L for _L in conv_dict.keys()}
+#             tree_map_fn = lambda _L : layer_dict['mlp'][_L](inputs=conv_dict[_L], epsilon)
+#             return jax.tree_util.tree_map(tree_map_fn, reference_dict), rbf_inputs, unit_r_ij, norms, epsilon
+#         self._fori_body_fn = fori_body_fn
+#
+#
+#     def __call__(self,
+#                  t : float,
+#                  xs_and_vs : Array,
+#                  feature_dictionary : ArrayTree,
+#                  epsilon : Optional[float] = tfn.DEFAULT_EPSILON,
+#                  mask_value : Optional[float] = 0.,
+#                  ):
+#         positions, velocities = xs_and_vs[0], xs_and_vs[1]
+#
+#         #simple check on feature dictionary
+#         if feature_dictionary[0].shape != (self._num_particles, self._input_L0_channel_dimension, 1):
+#             raise ValueError(f"""the feature dictionary's L=0 input ({feature_dictionary[0].shape})
+#                                  is not equal to the specified channel dimension
+#                                  ({(self._num_particles, self._input_L0_channel_dimension, 1)})""")
+#         elif feature_dictionary[1] is not None:
+#             raise ValueError(f"the input feature dictionary should have no annotations on the L=1 input")
+#
+#         r_ij = tfn.DEFAULT_VDISPLACEMENT_FN(positions, positions)
+#         unit_r_ij, norms = tfn.unit_vectors_and_norms(r_ij) # compute unit vectors and norms
+#         norms = tfn.mask_tensor(norms, mask_val = mask_value)
+#         norms = jnp.squeeze(norms)
+#
+#         rbf_inputs = self.SinusoidalBasis_module(r_ij = norms, epsilon=epsilon, mask_val=mask_value)
+#
+#         # concat feature dictionary with time convolutions.
+#         time_convolution = self.time_convolution_module(Array([t]))
+#         repeated_time_convolution = jnp.repeat(time_convolution[jnp.newaxis, ..., jnp.newaxis], repeats=self._num_particles, axis=0)
+#         aug_L0 = jnp.hstack([feature_dict[0], repeated_time_convolution])
+#         in_tensor_dict = {L : _tensor for L, _tensor in feature_dictionary.items()}
+#         in_tensor_dict[0] = aug_L0
+#
+#         final_out = hk.fori_loop(0, len(self.layers), self._fori_body_fn, (in_tensor_dict, ))
+#
+#         for layer_idx in range(len(self.layers)):
+#             out_tensor_dict = {}
+#             layer_dict = self.layers[layer_idx]
+#             conv_dict = layer_dict['conv'](in_tensor_dict=in_tensor_dict, rbf_inputs=rbf_inputs, unit_vectors=unit_r_ij, r_ij = norms, epsilon = tfn.DEFAULT_EPSILON)
+#             for _L in conv_dict.keys(): #iterate over the mlps/angular numbers
+#                 mlp = layer_dict['mlp'][_L]
+#                 p_array = mlp(inputs=conv_dict[_L], epsilon=epsilon) # pass convolved arrays through mlp
+#                 out_tensor_dict[_L] = p_array # populate out dict
+#             in_tensor_dict = out_tensor_dict
+#
+#         # extract and update
+#         scales = in_tensor_dict[1][:,0,:]
+#         translations = in_tensor_dict[1][:,1,:]
+#         return jnp.array([velocities, scales * velocities + translations]), scales, translations
 
 """
 Vector Modules
@@ -738,6 +751,17 @@ class VectorModule(hk.Module):
             layers[layer] = {'conv': conv_module, 'mlp': tfn_module_dict}
         self.layers = layers
 
+        # make vmap and fori functions
+        def fori_body_fn(layer_idx, val_tuple):
+            layer_dict = self.layers[layer_idx]
+            in_tensor_dict, rbf_inputs, unit_r_ij, norms = val_tuple
+            conv_dict = layer_dict['conv'](in_tensor_dict=in_tensor_dict, rbf_inputs=rbf_inputs, unit_vectors=unit_r_ij, r_ij = norms, epsilon = self._epsilon)
+            reference_dict = {_L : _L for _L in conv_dict.keys()}
+            tree_map_fn = lambda _L : layer_dict['mlp'][_L](inputs=conv_dict[_L], epsilon = self._epsilon)
+            return jax.tree_util.tree_map(tree_map_fn, reference_dict), rbf_inputs, unit_r_ij, norms
+
+        self._fori_body_fn = fori_body_fn
+
     def __call__(self,
                  t : float,
                  y : Array,
@@ -771,15 +795,8 @@ class VectorModule(hk.Module):
         in_tensor_dict = {L : _tensor for L, _tensor in self._feature_dictionary.items()}
         in_tensor_dict[0] = aug_L0
 
-        for layer_idx in range(len(self.layers)):
-            out_tensor_dict = {}
-            layer_dict = self.layers[layer_idx]
-            conv_dict = layer_dict['conv'](in_tensor_dict=in_tensor_dict, rbf_inputs=rbf_inputs, unit_vectors=unit_r_ij, r_ij = norms, epsilon = self._epsilon)
-            for _L in conv_dict.keys(): #iterate over the mlps/angular numbers
-                mlp = layer_dict['mlp'][_L]
-                p_array = mlp(inputs=conv_dict[_L], epsilon=self._epsilon) # pass convolved arrays through mlp
-                out_tensor_dict[_L] = p_array # populate out dict
-            in_tensor_dict = out_tensor_dict
+        final_out = hk.fori_loop(0, len(self.layers), self._fori_body_fn, (in_tensor_dict, rbf_inputs, unit_r_ij, norms, epsilon))
+        in_tensor_dict = final_out[0]
 
         # extract and update
         scales = in_tensor_dict[1][:,0,:]
