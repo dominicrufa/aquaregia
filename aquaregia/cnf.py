@@ -751,17 +751,6 @@ class VectorModule(hk.Module):
             layers[layer] = {'conv': conv_module, 'mlp': tfn_module_dict}
         self.layers = layers
 
-        # make vmap and fori functions
-        def fori_body_fn(layer_idx, val_tuple):
-            layer_dict = self.layers[layer_idx]
-            in_tensor_dict, rbf_inputs, unit_r_ij, norms = val_tuple
-            conv_dict = layer_dict['conv'](in_tensor_dict=in_tensor_dict, rbf_inputs=rbf_inputs, unit_vectors=unit_r_ij, r_ij = norms, epsilon = self._epsilon)
-            reference_dict = {_L : _L for _L in conv_dict.keys()}
-            tree_map_fn = lambda _L : layer_dict['mlp'][_L](inputs=conv_dict[_L], epsilon = self._epsilon)
-            return jax.tree_util.tree_map(tree_map_fn, reference_dict), rbf_inputs, unit_r_ij, norms
-
-        self._fori_body_fn = fori_body_fn
-
     def __call__(self,
                  t : float,
                  y : Array,
@@ -795,8 +784,15 @@ class VectorModule(hk.Module):
         in_tensor_dict = {L : _tensor for L, _tensor in self._feature_dictionary.items()}
         in_tensor_dict[0] = aug_L0
 
-        final_out = hk.fori_loop(0, len(self.layers), self._fori_body_fn, (in_tensor_dict, rbf_inputs, unit_r_ij, norms, epsilon))
-        in_tensor_dict = final_out[0]
+        for layer_idx in range(len(self.layers)):
+            out_tensor_dict = {}
+            layer_dict = self.layers[layer_idx]
+            conv_dict = layer_dict['conv'](in_tensor_dict=in_tensor_dict, rbf_inputs=rbf_inputs, unit_vectors=unit_r_ij, r_ij = norms, epsilon = self._epsilon)
+            for _L in conv_dict.keys(): #iterate over the mlps/angular numbers
+                mlp = layer_dict['mlp'][_L]
+                p_array = mlp(inputs=conv_dict[_L], epsilon=self._epsilon) # pass convolved arrays through mlp
+                out_tensor_dict[_L] = p_array # populate out dict
+            in_tensor_dict = out_tensor_dict
 
         # extract and update
         scales = in_tensor_dict[1][:,0,:]
