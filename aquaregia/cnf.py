@@ -431,20 +431,24 @@ class CNFFactory(object):
             non-jittable train function that records training/validation data throughout training.
             """
             import tqdm
-            train_values, validate_values = [], []
+            import time
+            train_values, validate_values, train_timings = [], [], []
             opt_state = init_fun(init_params) # initialize the opt state
             trange = tqdm.trange(num_iters, desc=f"Bar desc", leave=True)
             for i in trange: # begin for loop
                 run_seed, seed = random.split(seed)
+                start_time = time.time()
                 train_value, opt_state = step(key = run_seed, _iter=i, opt_state = opt_state, clip_gradient_max_norm=clip_gradient_max_norm)
+                end_time = time.time()
                 train_values.append(train_value)
+                train_timings.append(end_time-start_time)
                 if validate_frequency is not None and i % validate_frequency == 0 and batch_validate_loss_fn is not None:
                     validate_seed, seed = jax.random.split(seed)
                     validate_value = jax.jit(batch_validate_loss_fn)(get_params(opt_state), validate_seed)
                     validate_values.append(validate_value)
                 trange.set_description(f"test loss: {train_value}")
                 trange.refresh() # halt this?
-            return opt_state, Array(train_values), Array(validate_values)
+            return opt_state, Array(train_values), Array(validate_values), Array(train_timings)
 
         return_dict = {'init_parameters' : init_parameters,
                        'step_fn' : step,
