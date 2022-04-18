@@ -77,7 +77,7 @@ def exact_kinematic_aug_diff_f(t, y, args_tuple):
     aug_diff_fn = lambda __y : diff_f(t, __y, (_params,))
     _f, scales, translations = aug_diff_fn(_y)
     trace = jnp.sum(scales)
-    return _f, trace, jnp.sum(_f**2)
+    return _f, trace, jnp.sum(scales**2) + jnp.sum(translations**2)
 
 """
 ode solvers
@@ -150,6 +150,7 @@ class CNFFactory(object):
                  time_horizon : Optional[float] = 1.,
                  stepsize_controller_module : Optional[EQ_MODULE] = None,
                  stepsize_controller_module_kwarg_dict : Optional[dict] = {},
+                 aux_diffeqsolve_kwargs : Optional[dict] = {'adjoint' : diffrax.BacksolveAdjoint()}, # because long jit compilation time
                  **kwargs # for show
                 ):
 
@@ -166,6 +167,7 @@ class CNFFactory(object):
         self._trace_estimator = trace_estimator_method
         self._stepsize_controller_module = stepsize_controller_module
         self._stepsize_controller_module_kwarg_dict = stepsize_controller_module_kwarg_dict
+        self._aux_diffeqsolve_kwargs = aux_diffeqsolve_kwargs
 
 
         self._batch_size = batch_size
@@ -288,7 +290,16 @@ class CNFFactory(object):
             stepsize_controller = stepsize_mod(**stepsize_kwarg_dict)
             solver = Dopri5() # define a solver; TODO : allow user to change this in future if we need higher precision
             aug_init_y = (init_y, 0., 0.) # the second argument is the trace counter
-            sol = diffeqsolve(term, solver, t0=start_time, t1=end_time, dt0=dt, y0=aug_init_y, stepsize_controller = stepsize_controller, args=(parameters, hutch_key, canonical_diff_fn))
+            sol = diffeqsolve(term,
+                              solver,
+                              t0=start_time,
+                              t1=end_time,
+                              dt0=dt,
+                              y0=aug_init_y,
+                              stepsize_controller = stepsize_controller,
+                              args=(parameters, hutch_key, canonical_diff_fn),
+                              **self._aux_diffeqsolve_kwargs
+                              )
             return sol
         return init_parameters, canonical_diff_fn, ode_solver
 
@@ -488,6 +499,7 @@ class KinematicCNFFactory(CNFFactory):
                  time_horizon : Optional[float] = 1.,
                  stepsize_controller_module : Optional[EQ_MODULE] = None,
                  stepsize_controller_module_kwarg_dict : Optional[dict] = {},
+                 aux_diffeqsolve_kwargs : Optional[dict] = {'adjoint' : diffrax.BacksolveAdjoint()},
                  **kwargs
                 ):
         self._velocity_sampler = velocity_sampler
@@ -510,6 +522,7 @@ class KinematicCNFFactory(CNFFactory):
                          time_horizon=time_horizon,
                          stepsize_controller_module=stepsize_controller_module,
                          stepsize_controller_module_kwarg_dict=stepsize_controller_module_kwarg_dict,
+                         aux_diffeqsolve_kwargs=aux_diffeqsolve_kwargs,
                          **kwargs)
 
         self._validate_velocity_dimensionality()
@@ -569,37 +582,42 @@ class KinematicCNFFactory(CNFFactory):
             setattr(self, f"_{direct}_train_bool", False)
 
     def get_pretrain_functions(self, canonical_diff_fn):
+        assert self._forward_train_bool and self._backward_train_bool, f"pretraining is only supported in the forward-and-backward training regime"
         init_fun, update_fun, get_params = self._optimizer(**self._optimizer_kwargs) # call the optimizer functions
 
         def pull_train_sample(key):
             forward_key, backward_key, bool_key = jax.random.split(key, num=3)
-            forward_data = jax.lax.cond(self._forward_train_bool,
-                                        lambda _key: self._prior_train_sampler(_key),
-                                        lambda _key: self._posterior_train_sampler(_key), forward_key)
-            backward_data = jax.lax.cond(self._backward_train_bool,
-                                         lambda _key: self._posterior_train_sampler(_key),
-                                         lambda _key : self._prior_train_sampler(_key), backward_key)
-            return jax.random.choice(bool_key, jnp.vstack([forward_data, backward_data]))
+            # forward_data = jax.lax.cond(self._forward_train_bool,
+            #                             lambda _key: self._prior_train_sampler(_key),
+            #                             lambda _key: self._posterior_train_sampler(_key), forward_key)
+            # backward_data = jax.lax.cond(self._backward_train_bool,
+            #                              lambda _key: self._posterior_train_sampler(_key),
+            #                              lambda _key : self._prior_train_sampler(_key), backward_key)
+            # return jax.random.choice(bool_key, jnp.vstack([forward_data, backward_data]))
+            return self._prior_train_sampler(forward_key), self._posterior_train_sampler(backward_key)
 
 
         def loss_fn(parameters, key, scale_target, translation_target):
             time_key, run_key = jax.random.split(key)
             t = jax.random.uniform(time_key, minval=self._t0, maxval=self._t1)
-            data = pull_train_sample(run_key)
-            _, scale, translation = canonical_diff_fn(t, data, (parameters,))
-            return jnp.sum((scale-scale_target)**2) + jnp.sum((translation-translation_target)**2)
+            fwd_data, bkwd_data = pull_train_sample(run_key)
+            fwd_f, fwd_scale, fwd_translation = canonical_diff_fn(t, fwd_data, (parameters,))
+            bkwd_f, bkwd_scale, bkwd_translation = canonical_diff_fn(t, bkwd_data, (parameters,))
+            fwd_loss = jnp.sum(fwd_scale**2) + jnp.sum(fwd_translation**2) # minimize the sum of squares of acceleration (we want to begin with a linear approximation of soln)
+            bkwd_loss = jnp.sum(bkwd_scale**2) + jnp.sum(bkwd_translation**2)
+            return fwd_loss + bkwd_loss
 
         def batch_loss_fn(parameters, key, scale_target, translation_target):
             keys = jax.random.split(key, num=self._batch_size)
-            return jnp.sum(jax.vmap(loss_fn, in_axes=(None, 0, None, None))(parameters, keys, scale_target, translation_target))
+            return jnp.mean(jax.vmap(loss_fn, in_axes=(None, 0, None, None))(parameters, keys, scale_target, translation_target))
 
 
         @jax.jit
         def step(key, _iter, opt_state, clip_gradient_max_norm, scale_target, translation_target):
             in_params = get_params(opt_state) # extract the parameters from state
             val, param_grads = jax.value_and_grad(batch_loss_fn)(in_params, key, scale_target, translation_target) # compute value and grad
-            new_opt_state = update_fun(_iter, jax.example_libraries.optimizers.clip_grads(param_grads, clip_gradient_max_norm), opt_state) # update the state with the vals and grads
-            return mean_val, new_opt_state
+            opt_state = update_fun(_iter, jax.example_libraries.optimizers.clip_grads(param_grads, clip_gradient_max_norm), opt_state) # update the state with the vals and grads
+            return val, opt_state
 
         def train(init_params, key, num_iters, clip_gradient_max_norm=1e1, scale_target=-1e2, translation_target=0.):
             import tqdm
@@ -607,7 +625,7 @@ class KinematicCNFFactory(CNFFactory):
             opt_state = init_fun(init_params)
             trange = tqdm.trange(num_iters, desc="Bar desc", leave=True)
             for i in trange:
-                run_seed, seed = jax.random.split(key)
+                run_seed, key = jax.random.split(key)
                 val, opt_state = step(run_seed, _iter=i, opt_state=opt_state, clip_gradient_max_norm=clip_gradient_max_norm, scale_target=scale_target, translation_target=translation_target)
                 train_values.append(val)
                 trange.set_description(f"test loss: {val}")
@@ -621,9 +639,14 @@ class KinematicCNFFactory(CNFFactory):
         just like the super init, except we also equip the dict with a pre-training function
         """
         out_dict = super().get_utils(init_key, regulariser_lambda) # super it!
-        canonical_diff_fn = out_dict['canonical_differential_fn']
-        pretrain_fn = self.get_pretrain_functions(canonical_diff_fn)
-        out_dict['pretrain_fn'] = pretrain_fn
+
+        if self._forward_train_bool and self._backward_train_bool:
+            canonical_diff_fn = out_dict['canonical_differential_fn']
+            pretrain_fn = self.get_pretrain_functions(canonical_diff_fn)
+            out_dict['pretrain_fn'] = pretrain_fn
+        else:
+            print(f"omitting pretraining equipment")
+
         return out_dict
 
 # """
@@ -798,6 +821,8 @@ class VectorModule(hk.Module):
                 out_tensor_dict[_L] = p_array # populate out dict
             in_tensor_dict = out_tensor_dict
 
+        # return in_tensor_dict
+        #
         # extract and update
         scales = in_tensor_dict[1][:,0,:]
         translations = in_tensor_dict[1][:,1,:]
