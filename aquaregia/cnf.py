@@ -649,96 +649,202 @@ class KinematicCNFFactory(CNFFactory):
 
         return out_dict
 
-# """
-# vector module utils for CNF
-# """
-# class VectorModule(hk.Module):
-#     """
-#     a vector module for SE(3) equivariance
-#     """
-#     def __init__(self,
-#                  num_particles : int,
-#                  input_L0_channel_dimension : tuple,
-#                  conv_dict_list : Iterable,
-#                  mlp_dict_list : Iterable,
-#                  SinusoidalBasis_kwargs : dict,
-#                  time_convolution_kwargs : dict,
-#                  name : Optional[str] = f"vector"):
-#         super().__init__(name=name)
-#         self.SinusoidalBasis_module = tfn.SinusoidalBasis(**SinusoidalBasis_kwargs)
-#         self._num_particles = num_particles
-#         self._input_L0_channel_dimension = input_L0_channel_dimension
-#
-#         # time convolution
-#         self.time_convolution_module = hk.nets.MLP(**time_convolution_kwargs)
-#
-#         # setup the for loop
-#         layers = {}
-#         num_layers = len(conv_dict_list)
-#         for layer in range(num_layers):
-#             conv_module = tfn.Convolution(**conv_dict_list[layer])
-#             tfn_module_dict = {_L: tfn.TensorFieldMLP(**mlp_dict_list[layer][_L]) for _L in mlp_dict_list[layer].keys()}
-#             layers[layer] = {'conv': conv_module, 'mlp': tfn_module_dict}
-#         self.layers = layers
-#
-#         # make vmap and fori functions
-#         def fori_body_fn(layer_idx, val_tuple):
-#             layer_dict = self.layers[layer_idx]
-#             in_tensor_dict, rbf_inputs, unit_r_ij, norms, epsilon = val_tuple
-#             conv_dict = layer_dict['conv'](in_tensor_dict=in_tensor_dict, rbf_inputs=rbf_inputs, unit_vectors=unit_r_ij, r_ij = norms, epsilon = tfn.DEFAULT_EPSILON)
-#             reference_dict = {_L : _L for _L in conv_dict.keys()}
-#             tree_map_fn = lambda _L : layer_dict['mlp'][_L](inputs=conv_dict[_L], epsilon)
-#             return jax.tree_util.tree_map(tree_map_fn, reference_dict), rbf_inputs, unit_r_ij, norms, epsilon
-#         self._fori_body_fn = fori_body_fn
-#
-#
-#     def __call__(self,
-#                  t : float,
-#                  xs_and_vs : Array,
-#                  feature_dictionary : ArrayTree,
-#                  epsilon : Optional[float] = tfn.DEFAULT_EPSILON,
-#                  mask_value : Optional[float] = 0.,
-#                  ):
-#         positions, velocities = xs_and_vs[0], xs_and_vs[1]
-#
-#         #simple check on feature dictionary
-#         if feature_dictionary[0].shape != (self._num_particles, self._input_L0_channel_dimension, 1):
-#             raise ValueError(f"""the feature dictionary's L=0 input ({feature_dictionary[0].shape})
-#                                  is not equal to the specified channel dimension
-#                                  ({(self._num_particles, self._input_L0_channel_dimension, 1)})""")
-#         elif feature_dictionary[1] is not None:
-#             raise ValueError(f"the input feature dictionary should have no annotations on the L=1 input")
-#
-#         r_ij = tfn.DEFAULT_VDISPLACEMENT_FN(positions, positions)
-#         unit_r_ij, norms = tfn.unit_vectors_and_norms(r_ij) # compute unit vectors and norms
-#         norms = tfn.mask_tensor(norms, mask_val = mask_value)
-#         norms = jnp.squeeze(norms)
-#
-#         rbf_inputs = self.SinusoidalBasis_module(r_ij = norms, epsilon=epsilon, mask_val=mask_value)
-#
-#         # concat feature dictionary with time convolutions.
-#         time_convolution = self.time_convolution_module(Array([t]))
-#         repeated_time_convolution = jnp.repeat(time_convolution[jnp.newaxis, ..., jnp.newaxis], repeats=self._num_particles, axis=0)
-#         aug_L0 = jnp.hstack([feature_dict[0], repeated_time_convolution])
-#         in_tensor_dict = {L : _tensor for L, _tensor in feature_dictionary.items()}
-#         in_tensor_dict[0] = aug_L0
-#
-#         final_out = hk.fori_loop(0, len(self.layers), self._fori_body_fn, (in_tensor_dict, ))
-#
-#         for layer_idx in range(len(self.layers)):
-#             out_tensor_dict = {}
-#             layer_dict = self.layers[layer_idx]
-#             conv_dict = layer_dict['conv'](in_tensor_dict=in_tensor_dict, rbf_inputs=rbf_inputs, unit_vectors=unit_r_ij, r_ij = norms, epsilon = tfn.DEFAULT_EPSILON)
-#             for _L in conv_dict.keys(): #iterate over the mlps/angular numbers
-#                 mlp = layer_dict['mlp'][_L]
-#                 p_array = mlp(inputs=conv_dict[_L], epsilon=epsilon) # pass convolved arrays through mlp
-#                 out_tensor_dict[_L] = p_array # populate out dict
-#             in_tensor_dict = out_tensor_dict
-#
-#         # extract and update
-#         scales = in_tensor_dict[1][:,0,:]
-#         translations = in_tensor_dict[1][:,1,:]
-#         return jnp.array([velocities, scales * velocities + translations]), scales, translations
+class FlussFactory(CNFFactory):
+    """
+    OpFluss Factory
+    """
+    def __init__(self,
+                 support_dimension : tuple,
+                 logp_prior : Callable[Array, float],
+                 logp_posterior : Callable[Array, float],
+                 prior_train_data : Array,
+                 posterior_train_data : Array,
+                 module : MODULE,
+                 module_kwargs : dict,
+                 batch_size : int,
+                 optimizer : OPTIMIZER,
+                 optimizer_kwargs : dict,
+                 prior_validate_data : Optional[Array] = None,
+                 posterior_validate_data : Optional[Array] = None,
+                 init_key : Optional[KEY] = jax.random.PRNGKey(4256)):
+        """
+        initializer
+        """
+        # set the dimension of the support
+        self._support_dimension = support_dimension
+
+        # samplers and logp calculators; take array of support dimension and return a float
+        self._logp_prior = logp_prior
+        self._logp_posterior = logp_posterior
+
+        # create the attributes for the differential function module
+        self._module = module
+        self._module_kwargs = module_kwargs
+
+        self._batch_size = batch_size
+        self._optimizer = optimizer
+        self._optimizer_kwargs = optimizer_kwargs
+
+        # build the train samplers
+        self._make_train_samplers(prior_train_data, 'prior')
+        self._make_train_samplers(posterior_train_data, 'posterior')
+        if not (self._forward_train_bool or self._backward_train_bool):
+            raise ValueError(f"user must provide at least a prior or posterior train data. Neither was registered")
+
+        # build the validate samplers
+        self._make_validate(prior_validate_data, 'prior')
+        self._make_validate(posterior_validate_data, 'posterior')
+
+    def get_canonical_fn_and_parameters(self, init_key):
+        """
+        the canonical_fn should take a float pseudotime and a set of coords y; it should return a mu, sigma, updated posit, and a logp
+        """
+        def _wrapper(in_y, out_y, hutch_key):
+            out_tuple = self._module(**self._module_kwargs)(in_y, out_y, hutch_key)
+            return out_tuple
+
+        # transform the differential
+        fn_init, fn_apply = hk.without_apply_rng(hk.transform(_wrapper))
+
+        #initialize the differential function
+        ys_key, fwd_init_key, bkwd_init_key = jax.random.split(init_key, num=3)
+        if self._forward_train_bool:
+            init_y = self._prior_train_sampler(ys_key)
+        else:
+            init_y = self._posterior_train_sampler(ys_key)
+
+        fwd_init_params = fn_init(fwd_init_key, init_y, out_y=None, hutch_key=fwd_init_key)
+        bkwd_init_params = fn_init(bkwd_init_key, init_y, out_y=None, hutch_key=bkwd_init_key)
+        return fwd_init_params, bkwd_init_params, fn_apply
+
+    def get_loss_functions(self, init_key):
+        fwd_init_params, bkwd_init_params, canonicalized_fn = self.get_canonical_fn_and_parameters(init_key)
+
+        def loss_fn(parameters, init_y, hutch_key, regulariser_lambda, forward):
+            fwd_parameters, bkwd_parameters = parameters
+            (logp_start, generator_params, back_params) = jax.lax.cond(forward,
+                                                                       lambda _y : (self._logp_prior(_y), fwd_parameters, bkwd_parameters),
+                                                                       lambda _y : (self._logp_posterior(_y), bkwd_parameters, fwd_parameters),
+                                                                       init_y
+                                                                      )
+            out_y, logp_transport, aux_dict = canonicalized_fn(generator_params, init_y, out_y=None, hutch_key=hutch_key)
+            _, back_logp_transport, back_aux_dict = canonicalized_fn(back_params, out_y, init_y, hutch_key=None)
+            logp_end = jax.lax.cond(forward, lambda _y : self._logp_posterior(_y), lambda _y : self._logp_prior(_y), out_y)
+            weight = logp_end - logp_start + back_logp_transport - logp_transport
+            # print(logp_end, logp_start, back_logp_transport, logp_transport)
+            return -weight
+        return (fwd_init_params, bkwd_init_params), canonicalized_fn, None, partial(loss_fn, forward=False), partial(loss_fn,forward=True)
+
+    def get_pretrain_functions(self, canonical_fn):
+        assert self._forward_train_bool and self._backward_train_bool, f"pretraining is only supported in the forward-and-backward training regime"
+        init_fun, update_fun, get_params = self._optimizer(**self._optimizer_kwargs) # call the optimizer functions
+
+        def pull_train_sample(key):
+            forward_key, backward_key, bool_key = jax.random.split(key, num=3)
+            return self._prior_train_sampler(forward_key), self._posterior_train_sampler(backward_key)
+
+
+        def loss_fn(parameters, key):
+            run_key, fwd_hutch, bkwd_hutch = jax.random.split(key, num=3)
+            fwd_params, bkwd_params = parameters
+            fwd_data, bkwd_data = pull_train_sample(run_key)
+            _, _, fwd_aux_dict = canonical_fn(fwd_params, fwd_data, None, fwd_hutch)
+            _, _, bkwd_aux_dict = canonical_fn(bkwd_params, bkwd_data, None, bkwd_hutch)
+            fwd_loss = jnp.mean(fwd_aux_dict['translations']**2) + jnp.mean(fwd_aux_dict['sigmas']**2)
+            bkwd_loss = jnp.mean(bkwd_aux_dict['translations']**2) + jnp.mean(bkwd_aux_dict['sigmas']**2)
+            return fwd_loss + bkwd_loss
+
+        def batch_loss_fn(parameters, key):
+            keys = jax.random.split(key, num=self._batch_size)
+            return jnp.mean(jax.vmap(loss_fn, in_axes=(None, 0))(parameters, keys))
+
+
+        @jax.jit
+        def step(key, _iter, opt_state, clip_gradient_max_norm):
+            in_params = get_params(opt_state) # extract the parameters from state
+            val, param_grads = jax.value_and_grad(batch_loss_fn)(in_params, key) # compute value and grad
+            opt_state = update_fun(_iter, jax.example_libraries.optimizers.clip_grads(param_grads, clip_gradient_max_norm), opt_state) # update the state with the vals and grads
+            return val, opt_state
+
+        def train(init_params, key, num_iters, clip_gradient_max_norm=1e1):
+            import tqdm
+            train_values = []
+            opt_state = init_fun(init_params)
+            trange = tqdm.trange(num_iters, desc="Bar desc", leave=True)
+            for i in trange:
+                run_seed, key = jax.random.split(key)
+                val, opt_state = step(run_seed, _iter=i, opt_state=opt_state, clip_gradient_max_norm=clip_gradient_max_norm)
+                train_values.append(val)
+                trange.set_description(f"test loss: {val}")
+                trange.refresh()
+            return get_params(opt_state), Array(train_values)
+        return train
+
+    def get_utils(self, init_key, regulariser_lambda):
+        """
+        just like the super init, except we also equip the dict with a pre-training function
+        """
+        out_dict = super().get_utils(init_key, regulariser_lambda) # super it!
+        if self._forward_train_bool and self._backward_train_bool:
+            canonical_diff_fn = out_dict['canonical_differential_fn']
+            pretrain_fn = self.get_pretrain_functions(canonical_diff_fn)
+            out_dict['pretrain_fn'] = pretrain_fn
+        else:
+            print(f"omitting pretraining equipment")
+        return out_dict
+
+class SequentialFlussFactory(FlussFactory):
+    """
+    modifier to `FlussFactory` that allows for calculation of logp sequences
+    """
+    def __init__(self,
+                 support_dimension : tuple,
+                 logp_prior : Callable[Array, float],
+                 logp_posterior : Callable[Array, float],
+                 prior_train_data : Array,
+                 posterior_train_data : Array,
+                 module : MODULE,
+                 module_kwargs : dict,
+                 batch_size : int,
+                 optimizer : OPTIMIZER,
+                 optimizer_kwargs : dict,
+                 prior_validate_data : Optional[Array] = None,
+                 posterior_validate_data : Optional[Array] = None,
+                 init_key : Optional[KEY] = jax.random.PRNGKey(4256)):
+        super().__init__(
+                         support_dimension = support_dimension,
+                         logp_prior = logp_prior,
+                         logp_posterior = logp_posterior,
+                         prior_train_data = prior_train_data,
+                         posterior_train_data = posterior_train_data,
+                         module = module,
+                         module_kwargs = module_kwargs,
+                         batch_size = batch_size,
+                         optimizer = optimizer,
+                         optimizer_kwargs = optimizer_kwargs,
+                         prior_validate_data = prior_validate_data,
+                         posterior_validate_data = posterior_validate_data,
+                         init_key = init_key)
+
+    def get_loss_functions(self, init_key):
+        fwd_init_params, bkwd_init_params, canonicalized_fn = self.get_canonical_fn_and_parameters(init_key)
+
+        def loss_fn(parameters, init_y, hutch_key, regulariser_lambda, forward):
+            fwd_parameters, bkwd_parameters = parameters
+            (logp_start, generator_params, back_params) = jax.lax.cond(forward,
+                                                                       lambda _y : (self._logp_prior(_y), fwd_parameters, bkwd_parameters),
+                                                                       lambda _y : (self._logp_posterior(_y), bkwd_parameters, fwd_parameters),
+                                                                       init_y
+                                                                      )
+            out_y, logp_transport, aux_dict = canonicalized_fn(generator_params, init_y, None, hutch_key)
+            _, back_logp_transport, back_aux_dict = canonicalized_fn(back_params, None, aux_dict['out_ys'][::-1], None) # backward
+            logp_end = jax.lax.cond(forward, lambda _y : self._logp_posterior(_y), lambda _y : self._logp_prior(_y), out_y)
+            weight = logp_end - logp_start + back_logp_transport - logp_transport
+            # print(logp_end, logp_start, back_logp_transport, logp_transport)
+            return -weight
+        return (fwd_init_params, bkwd_init_params), canonicalized_fn, None, partial(loss_fn, forward=False), partial(loss_fn,forward=True)
+
+
 
 """
 Vector Modules
@@ -755,7 +861,8 @@ class VectorModule(hk.Module):
                  time_convolution_kwargs : dict,
                  epsilon : Optional[float] = tfn.DEFAULT_EPSILON,
                  mask_value : Optional[float] = 0.,
-                 name : Optional[str] = f"vector"):
+                 name : Optional[str] = f"vector",
+                 t : Optional[float] = 1.):
         super().__init__(name=name)
         self.SinusoidalBasis_module = tfn.SinusoidalBasis(**SinusoidalBasis_kwargs)
 
@@ -765,6 +872,7 @@ class VectorModule(hk.Module):
         self._epsilon = epsilon
         self._mask_value = mask_value
         self._feature_dictionary = feature_dictionary
+        self._t = t
 
         # time convolution
         self.time_convolution_module = hk.nets.MLP(**time_convolution_kwargs)
@@ -779,10 +887,11 @@ class VectorModule(hk.Module):
         self.layers = layers
 
     def __call__(self,
-                 t : float,
-                 y : Array,
+                 in_y : Array,
+                 out_y : Optional[Array] = None,
+                 hutch_key : Optional[Array] = None
                  ):
-        positions, velocities = y[0], y[1]
+        positions = in_y
 
         #simple check on feature dictionary
         if self._feature_dictionary[0].shape != (self._num_particles, self._input_L0_channel_dimension, 1):
@@ -794,8 +903,6 @@ class VectorModule(hk.Module):
 
         if positions.shape[0] != self._num_particles:
             raise ValueError(f"the number of positions ({positions}) is not equal to the number of particles")
-        if positions.shape != velocities.shape:
-            raise ValueError(f"the position dimension does not match the velocity dimension")
 
         r_ij = tfn.DEFAULT_VDISPLACEMENT_FN(positions, positions)
         unit_r_ij, norms = tfn.unit_vectors_and_norms(r_ij) # compute unit vectors and norms
@@ -805,7 +912,7 @@ class VectorModule(hk.Module):
         rbf_inputs = self.SinusoidalBasis_module(r_ij = norms, epsilon=self._epsilon, mask_val=self._mask_value)
 
         # concat feature dictionary with time convolutions.
-        time_convolution = self.time_convolution_module(Array([t]))
+        time_convolution = self.time_convolution_module(Array([self._t]))
         repeated_time_convolution = jnp.repeat(time_convolution[jnp.newaxis, ..., jnp.newaxis], repeats=self._num_particles, axis=0)
         aug_L0 = jnp.hstack([self._feature_dictionary[0], repeated_time_convolution])
         in_tensor_dict = {L : _tensor for L, _tensor in self._feature_dictionary.items()}
@@ -821,12 +928,138 @@ class VectorModule(hk.Module):
                 out_tensor_dict[_L] = p_array # populate out dict
             in_tensor_dict = out_tensor_dict
 
-        # return in_tensor_dict
-        #
-        # extract and update
-        scales = in_tensor_dict[1][:,0,:]
+        #sigmas = std_devs = jnp.exp(in_tensor_dict[1][:,0,:])
+        sigmas = std_devs = jnp.repeat(jnp.exp(in_tensor_dict[0][:,0,:]), repeats=3, axis=-1)
         translations = in_tensor_dict[1][:,1,:]
-        return jnp.array([velocities, scales * velocities + translations]), scales, translations
+        mu = positions + translations
+
+        # generate the normal vectors
+        if out_y is not None: # we just need to report the logp
+            logp = jax.scipy.stats.norm.logpdf(out_y, loc=mu, scale=sigmas).sum()
+        else:
+            N = jax.random.normal(hutch_key, shape=(self._num_particles, 3))
+            # print(N.shape, sigmas.shape)
+            out_y = mu + N * sigmas
+            logp = jax.scipy.stats.norm.logpdf(out_y, loc=mu, scale=sigmas).sum()
+
+        aux_dict = {'mu': positions+translations, 'sigmas': sigmas, 'translations': translations}
+        return out_y, logp, aux_dict
+
+class SequentialVectorModule(hk.Module):
+    """
+    a sequential vector module for SE(3) equivariance
+    """
+    def __init__(self,
+                 feature_dictionary : dict,
+                 conv_dict_list : Iterable,
+                 mlp_dict_list : Iterable,
+                 SinusoidalBasis_kwargs : dict,
+                 time_convolution_kwargs : dict,
+                 epsilon : Optional[float] = tfn.DEFAULT_EPSILON,
+                 mask_value : Optional[float] = 0.,
+                 name : Optional[str] = f"vector",
+                 t : Optional[float] = 0.,
+                 num_iters : Optional[int] = 2):
+        super().__init__(name=name)
+        self.SinusoidalBasis_module = tfn.SinusoidalBasis(**SinusoidalBasis_kwargs)
+        num_particles, input_L0_channel_dimension = feature_dictionary[0].shape[:2]
+        self._num_particles = num_particles
+        self._input_L0_channel_dimension = input_L0_channel_dimension
+        self._epsilon = epsilon
+        self._mask_value = mask_value
+        self._feature_dictionary = feature_dictionary
+        self._t = t
+        self._num_iters = num_iters
+
+        # time convolution
+        self.time_convolution_module = hk.nets.MLP(**time_convolution_kwargs)
+
+        # setup the for loop
+        layers = {}
+        num_layers = len(conv_dict_list)
+        for layer in range(num_layers):
+            conv_module = tfn.Convolution(**conv_dict_list[layer])
+            tfn_module_dict = {_L: tfn.TensorFieldMLP(**mlp_dict_list[layer][_L]) for _L in mlp_dict_list[layer].keys()}
+            layers[layer] = {'conv': conv_module, 'mlp': tfn_module_dict}
+        self.layers = layers
+
+        def _scan_fn(carry, _iter):
+            (positions, key, out_ys) = carry
+            if out_ys is not None:
+                positions, out_y = out_ys[_iter], out_ys[_iter+1]
+            r_ij = tfn.DEFAULT_VDISPLACEMENT_FN(positions, positions)
+            unit_r_ij, norms = tfn.unit_vectors_and_norms(r_ij) # compute unit vectors and norms
+            norms = tfn.mask_tensor(norms, mask_val = self._mask_value)
+            norms = jnp.squeeze(norms)
+            rbf_inputs = self.SinusoidalBasis_module(r_ij = norms, epsilon=self._epsilon, mask_val=self._mask_value)
+            time_convolution = self.time_convolution_module(Array([(_iter+1.)/self._num_iters]))
+            repeated_time_convolution = jnp.repeat(time_convolution[jnp.newaxis, ..., jnp.newaxis], repeats=self._num_particles, axis=0)
+            aug_L0 = jnp.hstack([self._feature_dictionary[0], repeated_time_convolution])
+            in_tensor_dict = {L : _tensor for L, _tensor in self._feature_dictionary.items()}
+            in_tensor_dict[0] = aug_L0
+            for layer_idx in range(len(self.layers)):
+                out_tensor_dict = {}
+                layer_dict = self.layers[layer_idx]
+                conv_dict = layer_dict['conv'](in_tensor_dict=in_tensor_dict, rbf_inputs=rbf_inputs, unit_vectors=unit_r_ij, r_ij = norms, epsilon = self._epsilon)
+                for _L in conv_dict.keys(): #iterate over the mlps/angular numbers
+                    mlp = layer_dict['mlp'][_L]
+                    p_array = mlp(inputs=conv_dict[_L], epsilon=self._epsilon) # pass convolved arrays through mlp
+                    out_tensor_dict[_L] = p_array # populate out dict
+                in_tensor_dict = out_tensor_dict
+
+            sigmas = jnp.repeat(jnp.exp(in_tensor_dict[0][:,0,:]), repeats=3, axis=-1)
+            translations = in_tensor_dict[1][:,1,:]
+            mu = positions + translations
+
+            # generate the normal vectors
+            if out_ys is not None: # we just need to report the logp
+                logp = jax.scipy.stats.norm.logpdf(out_y, loc=mu, scale=sigmas).sum()
+            else:
+                key, hutch_key = jax.random.split(key)
+                N = jax.random.normal(hutch_key, shape=(self._num_particles, 3))
+                out_y = mu + N * sigmas
+                logp = jax.scipy.stats.norm.logpdf(out_y, loc=mu, scale=sigmas).sum()
+            aux_dict = {'mu': positions+translations, 'sigmas': sigmas, 'translations': translations, 'logp': logp, 'out_ys': out_y}
+            if out_ys is not None: # generator, so the first arg is None
+                out_y=None
+            return (out_y, key, out_ys), aux_dict
+
+        self._scan_fn = _scan_fn
+
+    def __call__(self,
+                 in_y : Array,
+                 out_ys : Optional[Array] = None,
+                 hutch_key : Optional[Array] = None
+                 ):
+        positions = in_y
+        generator_bool=True if positions is not None else False
+        if generator_bool and hutch_key is None:
+            raise ValueError(f"if `in_y` is present, we are in `generator` mode, so a key is necessary")
+        if not generator_bool and (in_y is not None and hutch_key is not None):
+            raise ValueError(f"if out_ys is not None, we are in compute mode, not generator mode")
+        if not generator_bool and len(out_ys) != self._num_iters+1:
+            raise ValueError(f"""in non generator mode, the number of """)
+
+        #simple check on feature dictionary
+        if self._feature_dictionary[0].shape != (self._num_particles, self._input_L0_channel_dimension, 1):
+            raise ValueError(f"""the feature dictionary's L=0 input ({feature_dictionary[0].shape})
+                                 is not equal to the specified channel dimension
+                                 ({(self._num_particles, self._input_L0_channel_dimension, 1)})""")
+        elif self._feature_dictionary[1] is not None:
+            raise ValueError(f"the input feature dictionary should have no annotations on the L=1 input")
+
+        if generator_bool and positions.shape[0] != self._num_particles:
+            raise ValueError(f"the number of positions ({positions}) is not equal to the number of particles")
+
+        in_carry = (positions, hutch_key, out_ys)
+        out_carry, aux_dict = hk.scan(self._scan_fn, in_carry, jnp.arange(self._num_iters))
+
+        out_positions, _, out_ys = out_carry
+        if generator_bool:
+            aux_dict['out_ys'] = jnp.concatenate([positions[jnp.newaxis, ...], aux_dict['out_ys']])
+        else:
+            aux_dict['out_ys'] = out_ys
+        return out_positions, jnp.sum(aux_dict['logp']), aux_dict
 
 """
 VectorModule helpers
