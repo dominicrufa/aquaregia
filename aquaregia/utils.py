@@ -17,6 +17,87 @@ Array = jnp.array # get arraytree
 ArrayTree = Union[jnp.ndarray, Iterable['ArrayTree'], Mapping[Any, 'ArrayTree']]
 EnergyFn = Callable[[Array, ...], float]
 
+def rmse(A,B):
+    """
+    compute rmse of A,B; each assumed to be `[n,3]`
+    """
+    assert A.shape==B.shape
+    n=A.shape[0]
+    _diff = A-B
+    err = jnp.sum(_diff*_diff)
+    return jnp.sqrt(err/n)
+
+def rigid_transform_3D(A, B):
+    """
+    expect an 3xN matrix of points;
+    returns R,t:
+      R = 3x3 rotation matrix
+      t=3x1 column vector
+
+    # adapted slightly from https://github.com/nghiaho12/rigid_transform_3D
+    # i omitted the reflection check since we should only be working in the space of small perturbations
+
+    Example:
+    >>> n=10
+    >>> point = jax.random.normal(jax.random.PRNGKey(23423), shape=(n,3))
+    >>> noised_point = point + jax.random.normal(jax.random.PRNGKey(456), shape=(n,3))*1e-2
+    >>> ret_R, ret_t = rigid_transform_3D(jnp.transpose(noised_point), jnp.transpose(point))
+    >>> recovered_noised_point = jnp.transpose(ret_R@jnp.transpose(noised_point)+ret_t)
+    >>> recovered_error = rmse(point, recovered_noised_point)
+    >>> unrecovered_error = rmse(point, noised_point)
+    >>> print(recovered_error, unrecovered_error)
+    >>> assert recovered_error < unrecovered_error # this should be easy
+
+    # it should be the case that `recovered_error` < ``
+    """
+    assert A.shape == B.shape
+
+    num_rows, num_cols = A.shape
+    if num_rows != 3:
+        raise Exception(f"matrix A is not 3xN, it is {num_rows}x{num_cols}")
+
+    num_rows, num_cols = B.shape
+    if num_rows != 3:
+        raise Exception(f"matrix B is not 3xN, it is {num_rows}x{num_cols}")
+
+    # find mean column wise
+    centroid_A = jnp.mean(A, axis=1)
+    centroid_B = jnp.mean(B, axis=1)
+
+    # ensure centroids are 3x1
+    centroid_A = centroid_A.reshape(-1, 1)
+    centroid_B = centroid_B.reshape(-1, 1)
+
+    # subtract mean
+    Am = A - centroid_A
+    Bm = B - centroid_B
+
+    H = Am @ jnp.transpose(Bm)
+
+    # sanity check
+    #if linalg.matrix_rank(H) < 3:
+    #    raise ValueError("rank of H = {}, expecting 3".format(linalg.matrix_rank(H)))
+
+    # find rotation
+    U, S, Vt = jnp.linalg.svd(H)
+    R = Vt.T @ U.T
+
+    # special reflection case
+    jax.lax.cond(jnp.linalg.det(R) < 0,
+                 lambda _R: jnp.transpose(Vt.at[2,:].set(Vt[2,:]*-1))@jnp.transpose(U),
+                 lambda _R: _R,
+                 R)
+#     if jnp.linalg.det(R) < 0:
+#         print("det(R) < R, reflection detected!, correcting for it ...")
+#         #Vt[2,:] *= -1
+#         mads = Vt[2,:] * -1
+#         Vt = Vt.at[2,:].set(mads)
+#         R = Vt.T @ U.T
+
+    t = -R @ centroid_A + centroid_B
+
+    return R, t
+
 # E(n)-Equivariant Graph Fns
 class Graph(NamedTuple): #a NamedTuple object for the graph node (it carries latent features hs, positions xs, and velocities vs)
     """

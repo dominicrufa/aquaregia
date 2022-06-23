@@ -16,6 +16,7 @@ def make_energy_module(max_L : int,
                        num_particles : int,
                        lifted_particles : Optional[Sequence] = [],
                        SinusoidalBasis_kwargs : Optional[dict] = {'r_switch': 2., 'r_cut': 2.5},
+                       feature_mlp_kwargs : Optional[dict] = None,
                        conv_shapes_dict : Optional[dict] = {0: {'output_sizes': [8,8], 'activation': jax.nn.swish},
                                                             1: {'output_sizes': [8,8], 'activation': jax.nn.swish}},
                        tf_mlp_shapes_dict : Optional[dict] = {0: {0: {'output_sizes': [8,8], 'nonlinearity': jax.nn.swish},
@@ -59,6 +60,7 @@ def make_energy_module(max_L : int,
     feature_dict = { 0:random.normal(random.PRNGKey(253), shape=(N, hs_feature_size,1)), 1: None}
 
     """
+    print(f"making energy module...")
     num_layers = len(conv_shapes_dict)
     conv_switching_fn = functools.partial(polynomial_switching_fn,
                                      r_cutoff = SinusoidalBasis_kwargs['r_cut'],
@@ -137,12 +139,19 @@ def make_energy_module(max_L : int,
         def __init__(self,
                      num_particles,
                      name : Optional[str] = f"energy",
+                     feature_mlp_kwargs : Optional[dict] = None,
                     ):
             """
             initializer for `EnergyModule`
+            feature_mlp_kwargs : args to an MLP that convolve the input L=0 of the feature dict
             """
             super().__init__(name=name)
             self.SinusoidalBasis_module = tfn.SinusoidalBasis(**SinusoidalBasis_kwargs)
+            if feature_mlp_kwargs is not None:
+                self.feature_convolution_module = hk.nets.MLP(**feature_mlp_kwargs)
+            else:
+                self.feature_convolution_module = None
+
             self._num_particles = num_particles
 
             # setup the for loop
@@ -188,7 +197,14 @@ def make_energy_module(max_L : int,
             rbf_inputs = self.SinusoidalBasis_module(r_ij = squeezed_norms, epsilon=epsilon, mask_val=mask_value)
 
             # loop over convolutions and tf_mlps
-            in_tensor_dict = feature_dictionary
+            in_tensor_dict = {key: val for key, val in feature_dictionary.items()} # make a copy
+            if self.feature_convolution_module is not None:
+                if len(feature_dictionary[0].shape) != 2:
+                    raise ValueError(f"if passing features to be convolved in-module, then the raw L0 inputs should have a dimension of 2, but instead is of shape ({feature_dictionary[0].shape})")
+                convolved_features = self.feature_convolution_module(feature_dictionary[0])
+                # print(f"convolved L0 features shape: ", convolved_features.shape)
+                in_tensor_dict[0] = convolved_features[..., jnp.newaxis]
+
             for layer_idx in range(len(self.layers)):
                 out_tensor_dict = {}
                 layer_dict = self.layers[layer_idx]
@@ -209,7 +225,7 @@ def make_energy_module(max_L : int,
 
     # wrap the EnergyModule
     def energy_fn(positions, feature_dictionary, epsilon, mask_val, lifting_val):
-        return EnergyModule(num_particles=num_particles)(positions = positions,
+        return EnergyModule(num_particles=num_particles, feature_mlp_kwargs = feature_mlp_kwargs)(positions = positions,
                                                          feature_dictionary = feature_dictionary,
                                                          epsilon = epsilon,
                                                          mask_value = mask_val,
